@@ -1,19 +1,18 @@
-"""MetaHarnessEngine -- evolution via full-trace filesystem access.
+"""MetaHarnessEngine -- evolution via Claude Code as proposer.
 
-Core differences from AdaptiveSkillEngine:
-  1. Full traces: observations are NOT compressed into the prompt.
-     They live on the filesystem; the proposer browses them via bash.
-  2. All history: no last_n_cycles limit.  The proposer sees every
-     prior cycle's traces and can grep/cat selectively.
-  3. Minimal prompt: the proposer receives only the directory layout,
-     permissions, and objective.  Diagnosis strategy is its own.
-  4. Harness mutation (optional): when enabled, the proposer can also
-     modify a harness.py file containing agent scaffolding logic.
+Faithful to the Meta-Harness paper (Lee et al., 2026):
+  - Proposer is Claude Code CLI with Opus 4.6 via Bedrock
+  - Claude Code gets full filesystem access to the workspace
+    (including execution traces in evolution/observations/)
+  - A minimal "skill" prompt steers the search
+  - Claude Code decides what to inspect and how to mutate
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -22,33 +21,29 @@ from ...contract.workspace import AgentWorkspace
 from ...engine.base import EvolutionEngine
 from ...engine.history import EvolutionHistory
 from ...engine.trial import TrialRunner
-from ...llm.base import LLMMessage, LLMProvider
 from ...types import Observation, StepResult
 from .prompts import PROPOSER_SYSTEM_PROMPT, build_proposer_prompt
 
 logger = logging.getLogger(__name__)
 
+# Default model: Bedrock Opus 4.6 (same as the paper)
+DEFAULT_MODEL = "bedrock:us.anthropic.claude-opus-4-6-v1"
+
 
 class MetaHarnessEngine(EvolutionEngine):
-    """LLM-driven evolution with full-trace filesystem access.
+    """Evolution engine that uses Claude Code CLI as the proposer.
 
-    The proposer LLM gets bash access to the entire workspace including
-    the ``evolution/observations/`` directory containing raw execution
-    traces from all prior cycles.  It decides what to read, how to
-    diagnose failures, and what to mutate.
+    Claude Code browses the workspace filesystem — including raw
+    execution traces in ``evolution/observations/`` — and mutates
+    workspace files (prompts, skills, memory, tools, harness.py).
     """
 
-    def __init__(self, config: EvolveConfig, llm: LLMProvider | None = None):
+    def __init__(self, config: EvolveConfig):
         self.config = config
-        self._llm = llm
         self.harness_enabled: bool = config.extra.get("harness_enabled", False)
-
-    @property
-    def llm(self) -> LLMProvider:
-        if self._llm is None:
-            from ..adaptive_skill.tools import create_default_llm
-            self._llm = create_default_llm(self.config)
-        return self._llm
+        self.model: str = config.extra.get("proposer_model", DEFAULT_MODEL)
+        self.max_turns: int = config.extra.get("proposer_max_turns", 50)
+        self.timeout_sec: int = config.extra.get("proposer_timeout_sec", 600)
 
     def step(
         self,
@@ -59,10 +54,10 @@ class MetaHarnessEngine(EvolutionEngine):
     ) -> StepResult:
         """Run one Meta-Harness evolution step.
 
-        Unlike other engines, we do NOT inject observation data into the
-        prompt.  The observations are already persisted as JSONL files in
-        ``evolution/observations/`` by the loop's Observer.  We simply
-        tell the proposer where to find them.
+        Observations are already persisted as JSONL files in
+        ``evolution/observations/`` by the loop's Observer.  We tell
+        Claude Code where to find them via the proposer prompt; it
+        decides what to read.
         """
         cycle_num = history.latest_cycle + 1
         score_curve = history.get_score_curve()
@@ -80,8 +75,8 @@ class MetaHarnessEngine(EvolutionEngine):
             harness_enabled=self.harness_enabled,
         )
 
-        # Run proposer with bash tool access
-        response = self._run_proposer(prompt, workspace.root)
+        # Run Claude Code as the proposer
+        result = self._run_claude_code(prompt, workspace.root)
 
         # Detect what changed
         skills_after = {s.name for s in workspace.list_skills()}
@@ -101,7 +96,11 @@ class MetaHarnessEngine(EvolutionEngine):
             changes.append("harness.py modified")
 
         mutated = bool(changes)
-        summary = f"MetaHarness cycle {cycle_num}: {', '.join(changes)}" if changes else f"MetaHarness cycle {cycle_num}: no mutation"
+        summary = (
+            f"MetaHarness cycle {cycle_num}: {', '.join(changes)}"
+            if changes
+            else f"MetaHarness cycle {cycle_num}: no mutation"
+        )
 
         return StepResult(
             mutated=mutated,
@@ -112,46 +111,96 @@ class MetaHarnessEngine(EvolutionEngine):
                 "skills_before": len(skills_before),
                 "skills_after": len(skills_after),
                 "harness_enabled": self.harness_enabled,
-                "usage": response.get("usage", {}),
+                "proposer_model": self.model,
+                "proposer_exit_code": result.get("exit_code"),
+                "proposer_output_chars": len(result.get("output", "")),
             },
         )
 
-    def _run_proposer(self, prompt: str, workspace_root: Path) -> dict[str, Any]:
-        """Run the proposer LLM with bash access to the full workspace."""
-        from ..adaptive_skill.tools import BASH_TOOL_SPEC, make_workspace_bash
+    def _run_claude_code(self, prompt: str, workspace_root: Path) -> dict[str, Any]:
+        """Invoke Claude Code CLI as the proposer.
 
-        bash_fn = make_workspace_bash(workspace_root)
+        Runs in non-interactive mode (-p) with:
+          - --model: Bedrock Opus 4.6
+          - --system-prompt: minimal Meta-Harness skill
+          - --dangerously-skip-permissions: no interactive approval
+          - cwd: workspace root (Claude Code sees the full tree)
+        """
+        cmd = [
+            "claude",
+            "-p", prompt,
+            "--model", self.model,
+            "--system-prompt", PROPOSER_SYSTEM_PROMPT,
+            "--dangerously-skip-permissions",
+            "--output-format", "json",
+            "--no-session-persistence",
+            "--bare",
+        ]
+
+        logger.info(
+            "Running Claude Code proposer (model=%s, cwd=%s)",
+            self.model,
+            workspace_root,
+        )
 
         try:
-            from ...llm.bedrock import BedrockProvider
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_sec,
+                cwd=str(workspace_root),
+            )
 
-            if isinstance(self.llm, BedrockProvider):
-                response = self.llm.converse_loop(
-                    system_prompt=PROPOSER_SYSTEM_PROMPT,
-                    user_message=prompt,
-                    tools=[BASH_TOOL_SPEC],
-                    tool_executor={"workspace_bash": lambda command: bash_fn(command)},
-                    max_tokens=self.config.evolver_max_tokens,
+            output = proc.stdout.strip()
+            stderr = proc.stderr.strip()
+
+            if proc.returncode != 0:
+                logger.warning(
+                    "Claude Code exited with code %d: %s",
+                    proc.returncode,
+                    stderr[:500],
                 )
-                return {
-                    "content": response.content,
-                    "usage": response.usage,
-                }
-        except ImportError:
-            pass
 
-        # Fallback: non-Bedrock providers (no tool loop, single completion)
-        messages = [
-            LLMMessage(role="system", content=PROPOSER_SYSTEM_PROMPT),
-            LLMMessage(role="user", content=prompt),
-        ]
-        response = self.llm.complete(
-            messages, max_tokens=self.config.evolver_max_tokens
-        )
-        return {
-            "content": response.content,
-            "usage": response.usage,
-        }
+            # Try to parse JSON output for structured result
+            result_text = output
+            try:
+                parsed = json.loads(output)
+                result_text = parsed.get("result", output)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            logger.info(
+                "Claude Code finished (exit=%d, output=%d chars)",
+                proc.returncode,
+                len(output),
+            )
+
+            return {
+                "output": result_text,
+                "stderr": stderr,
+                "exit_code": proc.returncode,
+            }
+
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "Claude Code timed out after %ds", self.timeout_sec
+            )
+            return {
+                "output": "",
+                "stderr": "TIMEOUT",
+                "exit_code": -1,
+            }
+        except FileNotFoundError:
+            logger.error(
+                "Claude Code CLI not found. Install it: "
+                "https://docs.anthropic.com/en/docs/claude-code"
+            )
+            return {
+                "output": "",
+                "stderr": "claude CLI not found",
+                "exit_code": -1,
+            }
 
 
 def _read_harness(workspace: AgentWorkspace) -> str | None:
