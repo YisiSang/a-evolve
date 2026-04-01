@@ -1,17 +1,22 @@
 """MetaHarnessEngine -- evolution via Claude Code as proposer.
 
-Faithful to the Meta-Harness paper (Lee et al., 2026):
+Implements the Meta-Harness search framework (Lee et al., 2026):
   - Proposer is Claude Code CLI with Opus 4.6 via Bedrock
-  - Claude Code gets full filesystem access to the workspace
-    (including execution traces in evolution/observations/)
-  - A minimal "skill" prompt steers the search
-  - Claude Code decides what to inspect and how to mutate
+  - Growing filesystem archive stores every candidate's source code,
+    evaluation scores, and execution traces
+  - The proposer browses this archive with grep/cat/ls (~10M tokens)
+    rather than receiving compressed summaries in the prompt
+  - k candidates per iteration with Pareto-aware selection
+  - Interface validation before expensive evaluation
+  - Automatic rollback when score regresses
+  - Candidate archive persists across runs for cross-run transfer
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -29,13 +34,35 @@ logger = logging.getLogger(__name__)
 # Default model: Bedrock Opus 4.6 (same as the paper)
 DEFAULT_MODEL = "bedrock:us.anthropic.claude-opus-4-6-v1"
 
+# Workspace files to snapshot into each candidate archive
+_SNAPSHOT_DIRS = ("prompts", "skills", "memory", "tools")
+_SNAPSHOT_FILES = ("harness.py",)
+
 
 class MetaHarnessEngine(EvolutionEngine):
     """Evolution engine that uses Claude Code CLI as the proposer.
 
-    Claude Code browses the workspace filesystem — including raw
-    execution traces in ``evolution/observations/`` — and mutates
-    workspace files (prompts, skills, memory, tools, harness.py).
+    Maintains a growing candidate archive in ``evolution/candidates/``
+    that the proposer browses via filesystem access — matching the
+    paper's design of full trace + source code access per candidate.
+
+    Each evaluated candidate gets its own directory::
+
+        evolution/candidates/cycle_003_cand_1/
+        ├── snapshot/          # workspace files at time of proposal
+        │   ├── prompts/
+        │   ├── skills/
+        │   ├── harness.py
+        │   └── ...
+        ├── scores.json        # evaluation results {score, cost, selected, valid, ...}
+        └── traces/            # symlink or copy of observation batch
+
+    Features matching the paper:
+      - Full benchmark evaluation per candidate (eval_sample_size=0 → all tasks)
+      - Interface validation before expensive evaluation (Algorithm 1 line 11)
+      - Pareto frontier tracking across (score, cost) objectives
+      - Candidate archive persists across runs (cross-run knowledge transfer)
+      - Initial population evaluation handled by A-Evolve's loop (cycle 0)
     """
 
     def __init__(self, config: EvolveConfig):
@@ -44,6 +71,21 @@ class MetaHarnessEngine(EvolutionEngine):
         self.model: str = config.extra.get("proposer_model", DEFAULT_MODEL)
         self.max_turns: int = config.extra.get("proposer_max_turns", 50)
         self.timeout_sec: int = config.extra.get("proposer_timeout_sec", 600)
+        # Multi-candidate: generate k variants per cycle (paper: typically 2)
+        self.num_candidates: int = config.extra.get("num_candidates", 2)
+        # Evaluation sample size: 0 = all tasks (paper default), >0 = subsample
+        self.eval_sample_size: int = config.extra.get("eval_sample_size", 0)
+        # Rollback: revert if best candidate scores below current best.
+        # Default False to match the paper — Meta-Harness stores all
+        # candidates and allows temporary regressions for exploration.
+        # The Pareto frontier tracks the best across all cycles.
+        self.rollback_on_regression: bool = config.extra.get(
+            "rollback_on_regression", False
+        )
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     def step(
         self,
@@ -52,70 +94,368 @@ class MetaHarnessEngine(EvolutionEngine):
         history: EvolutionHistory,
         trial: TrialRunner,
     ) -> StepResult:
-        """Run one Meta-Harness evolution step.
+        """Run one Meta-Harness evolution step (Algorithm 1 inner loop).
 
-        Observations are already persisted as JSONL files in
-        ``evolution/observations/`` by the loop's Observer.  We tell
-        Claude Code where to find them via the proposer prompt; it
-        decides what to read.
+        For each of k candidates:
+          1. Reset workspace to pre-mutation state
+          2. Run Claude Code proposer (mutates workspace files)
+          3. Validate candidate interface (syntax check before eval)
+          4. Evaluate on benchmark tasks (full or sampled)
+          5. Archive candidate to evolution/candidates/
+
+        Then select best candidate (Pareto-aware), apply or rollback.
+
+        Note: Initial population evaluation (Algorithm 1 lines 3-5) is
+        handled by the A-Evolve loop's first SOLVE→OBSERVE cycle before
+        engine.step() is called.
         """
         cycle_num = history.latest_cycle + 1
         score_curve = history.get_score_curve()
+        current_best = max(score_curve) if score_curve else 0.0
 
-        # Snapshot workspace state before mutation
-        skills_before = {s.name for s in workspace.list_skills()}
-        prompt_before = workspace.read_prompt()
-        harness_before = _read_harness(workspace) if self.harness_enabled else None
+        candidates_dir = workspace.root / "evolution" / "candidates"
+        candidates_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build minimal proposer prompt
-        prompt = build_proposer_prompt(
-            workspace,
-            cycle_num,
-            score_curve,
-            harness_enabled=self.harness_enabled,
+        # Count existing candidates (includes prior runs — cross-run archive)
+        existing = len([
+            d for d in candidates_dir.iterdir() if d.is_dir()
+        ])
+
+        candidates: list[dict[str, Any]] = []
+
+        for i in range(self.num_candidates):
+            # Reset workspace to pre-mutation state before each candidate
+            if i > 0:
+                self._git_reset(workspace.root)
+
+            cand_label = f"cycle_{cycle_num:03d}_cand_{i}"
+
+            # Build prompt — tells proposer where the archive is
+            prompt = build_proposer_prompt(
+                workspace,
+                cycle_num,
+                score_curve,
+                harness_enabled=self.harness_enabled,
+                candidate_index=i,
+                num_candidates=self.num_candidates,
+                num_archived=existing + len(candidates),
+            )
+
+            # Run Claude Code proposer
+            result = self._run_claude_code(prompt, workspace.root)
+
+            # Capture diff before archiving
+            diff = self._git_diff(workspace.root)
+
+            # Interface validation (Algorithm 1 line 11):
+            # Check modified files are syntactically valid before eval
+            valid, validation_err = self._validate_candidate(workspace)
+
+            if valid:
+                # Evaluate on benchmark tasks
+                eval_result = self._evaluate_candidate(trial)
+                score = eval_result["score"]
+                cost = eval_result["cost"]
+            else:
+                logger.warning(
+                    "Candidate %s failed validation: %s — skipping eval",
+                    cand_label, validation_err,
+                )
+                score = 0.0
+                cost = 0.0
+
+            # Archive this candidate to the growing filesystem
+            cand_dir = candidates_dir / cand_label
+            self._archive_candidate(
+                workspace, cand_dir, score, cost, cycle_num, i, result,
+                valid=valid, validation_err=validation_err,
+            )
+
+            candidates.append({
+                "index": i,
+                "label": cand_label,
+                "score": score,
+                "cost": cost,
+                "diff": diff,
+                "valid": valid,
+                "validation_err": validation_err,
+                "exit_code": result.get("exit_code"),
+                "output_chars": len(result.get("output", "")),
+            })
+            logger.info(
+                "Candidate %s: valid=%s, score=%.3f, cost=%d (%d chars diff)",
+                cand_label, valid, score, cost, len(diff),
+            )
+
+        # -- Selection --
+        # Filter to valid candidates only
+        valid_candidates = [c for c in candidates if c["valid"]]
+
+        if not valid_candidates:
+            logger.warning("All %d candidates failed validation", len(candidates))
+            self._git_reset(workspace.root)
+            return StepResult(
+                mutated=False,
+                summary=(
+                    f"MetaHarness cycle {cycle_num}: "
+                    f"all {self.num_candidates} candidates failed validation"
+                ),
+                metadata={
+                    "cycle": cycle_num,
+                    "num_candidates": self.num_candidates,
+                    "all_invalid": True,
+                    "validation_errors": [c["validation_err"] for c in candidates],
+                    "proposer_model": self.model,
+                },
+            )
+
+        # Compute Pareto frontier across (score↑, cost↓)
+        frontier = _pareto_frontier(valid_candidates)
+        # Select the highest-scoring candidate from the frontier
+        best = max(frontier, key=lambda c: c["score"])
+
+        logger.info(
+            "Selected %s (score=%.3f, cost=%d) from %d candidates "
+            "(%d on Pareto frontier)",
+            best["label"], best["score"], best["cost"],
+            len(candidates), len(frontier),
         )
 
-        # Run Claude Code as the proposer
-        result = self._run_claude_code(prompt, workspace.root)
+        # Reset workspace to clean state
+        self._git_reset(workspace.root)
 
-        # Detect what changed
-        skills_after = {s.name for s in workspace.list_skills()}
-        prompt_after = workspace.read_prompt()
-        harness_after = _read_harness(workspace) if self.harness_enabled else None
+        # Mark selected candidate + Pareto frontier in archive
+        for c in candidates:
+            scores_path = candidates_dir / c["label"] / "scores.json"
+            if scores_path.exists():
+                data = json.loads(scores_path.read_text())
+                data["selected"] = (c["label"] == best["label"])
+                data["pareto_optimal"] = c in frontier
+                scores_path.write_text(json.dumps(data, indent=2))
 
-        changes = []
-        new_skills = skills_after - skills_before
-        removed_skills = skills_before - skills_after
-        if new_skills:
-            changes.append(f"+{len(new_skills)} skills")
-        if removed_skills:
-            changes.append(f"-{len(removed_skills)} skills")
-        if prompt_after != prompt_before:
-            changes.append("prompt modified")
-        if self.harness_enabled and harness_after != harness_before:
-            changes.append("harness.py modified")
+        # Rollback check: if best candidate regresses, don't apply
+        if self.rollback_on_regression and best["score"] < current_best:
+            logger.info(
+                "Best candidate %.3f < current best %.3f — rolling back",
+                best["score"], current_best,
+            )
+            return StepResult(
+                mutated=False,
+                summary=(
+                    f"MetaHarness cycle {cycle_num}: "
+                    f"{len(valid_candidates)} valid candidates evaluated, "
+                    f"rolled back (best={best['score']:.3f}, "
+                    f"current={current_best:.3f})"
+                ),
+                metadata={
+                    "cycle": cycle_num,
+                    "rolled_back": True,
+                    "num_candidates": self.num_candidates,
+                    "num_valid": len(valid_candidates),
+                    "candidate_scores": [c["score"] for c in candidates],
+                    "pareto_frontier": [c["label"] for c in frontier],
+                    "selected": best["label"],
+                    "current_best": current_best,
+                    "proposer_model": self.model,
+                },
+            )
 
-        mutated = bool(changes)
-        summary = (
-            f"MetaHarness cycle {cycle_num}: {', '.join(changes)}"
-            if changes
-            else f"MetaHarness cycle {cycle_num}: no mutation"
+        # Apply best candidate's diff to workspace
+        if best["diff"]:
+            self._apply_diff(workspace.root, best["diff"])
+
+        changes_summary = (
+            f"selected {best['label']} "
+            f"(score={best['score']:.3f}, cost={best['cost']})"
+            if best["diff"]
+            else "no mutation"
         )
 
         return StepResult(
-            mutated=mutated,
-            summary=summary,
+            mutated=bool(best["diff"]),
+            summary=f"MetaHarness cycle {cycle_num}: {changes_summary}",
             metadata={
                 "cycle": cycle_num,
-                "changes": changes,
-                "skills_before": len(skills_before),
-                "skills_after": len(skills_after),
+                "num_candidates": self.num_candidates,
+                "num_valid": len(valid_candidates),
+                "selected": best["label"],
+                "candidate_scores": [c["score"] for c in candidates],
+                "candidate_costs": [c["cost"] for c in candidates],
+                "pareto_frontier": [c["label"] for c in frontier],
+                "best_score": best["score"],
+                "best_cost": best["cost"],
                 "harness_enabled": self.harness_enabled,
                 "proposer_model": self.model,
-                "proposer_exit_code": result.get("exit_code"),
-                "proposer_output_chars": len(result.get("output", "")),
+                "total_archived": existing + len(candidates),
             },
         )
+
+    # ------------------------------------------------------------------
+    # Interface validation (Algorithm 1 line 11)
+    # ------------------------------------------------------------------
+
+    def _validate_candidate(
+        self, workspace: AgentWorkspace,
+    ) -> tuple[bool, str]:
+        """Validate candidate modifications before expensive evaluation.
+
+        Checks that modified Python files compile and key files are intact.
+        Returns (valid, error_message).
+        """
+        errors: list[str] = []
+
+        # Validate harness.py if it exists
+        harness_path = workspace.root / "harness.py"
+        if harness_path.exists():
+            try:
+                source = harness_path.read_text()
+                compile(source, str(harness_path), "exec")
+            except SyntaxError as e:
+                errors.append(f"harness.py: {e}")
+
+        # Validate tool Python files
+        tools_dir = workspace.root / "tools"
+        if tools_dir.exists():
+            for py_file in tools_dir.glob("*.py"):
+                try:
+                    source = py_file.read_text()
+                    compile(source, str(py_file), "exec")
+                except SyntaxError as e:
+                    errors.append(f"{py_file.name}: {e}")
+
+        # Validate system prompt is non-empty
+        prompt = workspace.read_prompt()
+        if prompt is not None and len(prompt.strip()) == 0:
+            errors.append("prompts/system.md is empty")
+
+        if errors:
+            return False, "; ".join(errors)
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # Candidate evaluation
+    # ------------------------------------------------------------------
+
+    def _evaluate_candidate(
+        self, trial: TrialRunner | None,
+    ) -> dict[str, Any]:
+        """Evaluate a candidate on benchmark tasks.
+
+        Returns dict with 'score' and 'cost' (total tokens).
+        When eval_sample_size=0, evaluates on all available tasks
+        (matching the paper's full-benchmark evaluation protocol).
+        """
+        if trial is None:
+            return {"score": 0.0, "cost": 0}
+
+        try:
+            if self.eval_sample_size > 0:
+                tasks = trial.get_tasks(limit=self.eval_sample_size)
+            else:
+                # eval_sample_size=0: evaluate on all available tasks
+                tasks = trial.get_tasks(limit=10000)
+
+            if not tasks:
+                return {"score": 0.0, "cost": 0}
+
+            obs = trial.run_tasks(tasks)
+            if not obs:
+                return {"score": 0.0, "cost": 0}
+
+            score = sum(o.feedback.score for o in obs) / len(obs)
+
+            # Estimate cost from trajectory token usage
+            total_tokens = 0
+            for o in obs:
+                for step in o.trajectory.steps:
+                    usage = step.get("usage", {})
+                    total_tokens += usage.get("total_tokens", 0)
+
+            return {"score": score, "cost": total_tokens}
+
+        except Exception as e:
+            logger.warning("Evaluation failed: %s", e)
+            return {"score": 0.0, "cost": 0}
+
+    # ------------------------------------------------------------------
+    # Candidate archiving — the growing filesystem
+    # ------------------------------------------------------------------
+
+    def _archive_candidate(
+        self,
+        workspace: AgentWorkspace,
+        cand_dir: Path,
+        score: float,
+        cost: int,
+        cycle: int,
+        cand_index: int,
+        proposer_result: dict[str, Any],
+        *,
+        valid: bool = True,
+        validation_err: str = "",
+    ) -> None:
+        """Archive a candidate's workspace snapshot + scores + traces.
+
+        Creates::
+            cand_dir/
+            ├── snapshot/          # copies of mutable workspace files
+            ├── scores.json        # evaluation score, cost, validation, metadata
+            └── traces/            # symlink to observation batch
+        """
+        cand_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Snapshot mutable workspace files
+        snapshot_dir = cand_dir / "snapshot"
+        snapshot_dir.mkdir(exist_ok=True)
+
+        for dirname in _SNAPSHOT_DIRS:
+            src = workspace.root / dirname
+            dst = snapshot_dir / dirname
+            if src.exists():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+
+        for fname in _SNAPSHOT_FILES:
+            src = workspace.root / fname
+            if src.exists():
+                shutil.copy2(src, snapshot_dir / fname)
+
+        # 2. Write scores + metadata
+        scores_data = {
+            "cycle": cycle,
+            "candidate_index": cand_index,
+            "score": score,
+            "cost": cost,
+            "valid": valid,
+            "validation_error": validation_err,
+            "selected": False,
+            "pareto_optimal": False,
+            "proposer_model": self.model,
+            "proposer_exit_code": proposer_result.get("exit_code"),
+        }
+        (cand_dir / "scores.json").write_text(
+            json.dumps(scores_data, indent=2)
+        )
+
+        # 3. Link traces — find the most recent observation batch
+        traces_dir = cand_dir / "traces"
+        traces_dir.mkdir(exist_ok=True)
+        obs_dir = workspace.root / "evolution" / "observations"
+        if obs_dir.exists():
+            batches = sorted(obs_dir.glob("batch_*.jsonl"))
+            if batches:
+                latest_batch = batches[-1]
+                link_target = traces_dir / latest_batch.name
+                try:
+                    link_target.symlink_to(latest_batch.resolve())
+                except OSError:
+                    # Fallback: copy if symlink fails
+                    shutil.copy2(latest_batch, link_target)
+
+        logger.debug("Archived candidate to %s", cand_dir)
+
+    # ------------------------------------------------------------------
+    # Claude Code CLI invocation
+    # ------------------------------------------------------------------
 
     def _run_claude_code(self, prompt: str, workspace_root: Path) -> dict[str, Any]:
         """Invoke Claude Code CLI as the proposer.
@@ -123,6 +463,7 @@ class MetaHarnessEngine(EvolutionEngine):
         Runs in non-interactive mode (-p) with:
           - --model: Bedrock Opus 4.6
           - --system-prompt: minimal Meta-Harness skill
+          - --max-turns: bounded exploration
           - --dangerously-skip-permissions: no interactive approval
           - cwd: workspace root (Claude Code sees the full tree)
         """
@@ -131,6 +472,7 @@ class MetaHarnessEngine(EvolutionEngine):
             "-p", prompt,
             "--model", self.model,
             "--system-prompt", PROPOSER_SYSTEM_PROMPT,
+            "--max-turns", str(self.max_turns),
             "--dangerously-skip-permissions",
             "--output-format", "json",
             "--no-session-persistence",
@@ -138,9 +480,8 @@ class MetaHarnessEngine(EvolutionEngine):
         ]
 
         logger.info(
-            "Running Claude Code proposer (model=%s, cwd=%s)",
-            self.model,
-            workspace_root,
+            "Running Claude Code proposer (model=%s, max_turns=%d, cwd=%s)",
+            self.model, self.max_turns, workspace_root,
         )
 
         try:
@@ -202,8 +543,104 @@ class MetaHarnessEngine(EvolutionEngine):
                 "exit_code": -1,
             }
 
+    # ------------------------------------------------------------------
+    # Git helpers for multi-candidate workflow
+    # ------------------------------------------------------------------
 
-def _read_harness(workspace: AgentWorkspace) -> str | None:
-    """Read harness.py from the workspace root, or None if absent."""
-    path = workspace.root / "harness.py"
-    return path.read_text() if path.exists() else None
+    def _git_reset(self, root: Path) -> None:
+        """Reset workspace to last committed state (discard uncommitted changes).
+
+        Preserves evolution/ directory (observations + candidate archive).
+        """
+        subprocess.run(
+            ["git", "checkout", "."],
+            cwd=str(root),
+            capture_output=True,
+        )
+        # Clean untracked files but preserve evolution/
+        subprocess.run(
+            ["git", "clean", "-fd", "--exclude=evolution/"],
+            cwd=str(root),
+            capture_output=True,
+        )
+
+    def _git_diff(self, root: Path) -> str:
+        """Capture current uncommitted changes as a diff.
+
+        Excludes evolution/ so only workspace mutations are captured.
+        """
+        # Stage everything so diff captures new files too
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=str(root),
+            capture_output=True,
+        )
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--", ".", ":(exclude)evolution/"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+        # Unstage
+        subprocess.run(
+            ["git", "reset", "HEAD", "--quiet"],
+            cwd=str(root),
+            capture_output=True,
+        )
+        return result.stdout
+
+    def _apply_diff(self, root: Path, diff: str) -> None:
+        """Apply a previously captured diff to the workspace."""
+        if not diff.strip():
+            return
+        proc = subprocess.run(
+            ["git", "apply", "--allow-empty", "-"],
+            input=diff,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            logger.warning("git apply failed: %s", proc.stderr[:500])
+            proc2 = subprocess.run(
+                ["git", "apply", "--3way", "-"],
+                input=diff,
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+            )
+            if proc2.returncode != 0:
+                logger.error(
+                    "git apply --3way also failed: %s", proc2.stderr[:500]
+                )
+
+
+# ----------------------------------------------------------------------
+# Pareto frontier computation
+# ----------------------------------------------------------------------
+
+def _pareto_frontier(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return Pareto-optimal candidates (maximize score, minimize cost).
+
+    A candidate is Pareto-optimal if no other candidate has both a
+    higher (or equal) score AND a lower (or equal) cost, with at least
+    one strict inequality.
+    """
+    frontier = []
+    for c in candidates:
+        dominated = False
+        for other in candidates:
+            if other is c:
+                continue
+            # 'other' dominates 'c' if:
+            #   other.score >= c.score AND other.cost <= c.cost
+            #   with at least one strict inequality
+            if (other["score"] >= c["score"]
+                    and other["cost"] <= c["cost"]
+                    and (other["score"] > c["score"]
+                         or other["cost"] < c["cost"])):
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(c)
+    return frontier
