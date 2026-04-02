@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from typing import Callable
 import json
 import logging
 import os
@@ -269,6 +270,7 @@ def run_evolution(
     max_cycles: int,
     config: EvolveConfig,
     tasks: list[Task] | None = None,
+    eval_factory: Callable | None = None,
 ) -> float:
     """Run the MetaHarness search loop."""
     print(f"\n{'=' * 60}")
@@ -290,6 +292,7 @@ def run_evolution(
             history=history,
             trial=trial,
             tasks=tasks,
+            eval_factory=eval_factory,
         )
 
         cycle_elapsed = time.time() - cycle_t0
@@ -540,9 +543,26 @@ def main():
 
         # Phase 1: Evolution
         if run_phases in ("1", "all"):
+            def _eval_factory(workspace_path: Path) -> ParallelMcpTrialRunner:
+                eval_agent = McpMHAgent(
+                    workspace_dir=workspace_path,
+                    model_id=solver_model,
+                    region=solver_region,
+                    max_tokens=solver_max_tokens,
+                    docker_image=docker_image,
+                    key_registry=key_registry,
+                )
+                return ParallelMcpTrialRunner(
+                    eval_agent, benchmark,
+                    max_workers=workers,
+                    docker_image=docker_image,
+                    key_registry=key_registry,
+                )
+
             best_score = run_evolution(
                 engine, agent, trial, observer, versioning, history,
                 observations, max_cycles, config, tasks=all_tasks,
+                eval_factory=_eval_factory,
             )
 
         # Phase 2: Final evaluation

@@ -11,35 +11,15 @@ Available hooks (all optional — delete or leave unimplemented to use defaults)
 """
 
 
-def build_system_prompt(base_prompt: str, skills: list, task_prompt: str | None = None) -> str:
-    """Assemble system prompt with skills.
+def build_system_prompt(base_prompt: str, skills: list) -> str:
+    """Assemble the system prompt.
 
-    Default implementation: append skill content inline.
-    The evolver may rewrite this to change skill injection strategy,
-    add chain-of-thought instructions, etc.
+    The default implementation returns the base prompt as-is.
+    Skills are available in the skills/ directory but are NOT injected
+    into the prompt by default — the parent class's read_skill tool
+    does not exist in the solver's tool set.
+
+    The MetaHarness proposer can evolve this hook to incorporate
+    skill content, add strategies, or restructure the prompt.
     """
-    parts = [base_prompt]
-
-    if skills and task_prompt:
-        # Simple keyword-based skill selection (matching McpAgent default)
-        task_lower = task_prompt.lower()
-        selected = []
-        for skill in skills:
-            keywords = skill.name.replace("-", " ").split()
-            keywords += skill.description.lower().split()
-            score = sum(1 for kw in keywords if kw in task_lower and len(kw) > 3)
-            if score >= 2:
-                selected.append((score, skill))
-        selected.sort(key=lambda x: x[0], reverse=True)
-        selected = [s for _, s in selected[:3]]
-
-        if selected:
-            parts.append("\n\n## Available Skills\n")
-            for skill in selected:
-                parts.append(f"- **{skill.name}**: {skill.description}")
-    elif skills:
-        parts.append("\n\n## Available Skills\n")
-        for skill in skills:
-            parts.append(f"- **{skill.name}**: {skill.description}")
-
-    return "\n".join(parts)
+    return base_prompt
