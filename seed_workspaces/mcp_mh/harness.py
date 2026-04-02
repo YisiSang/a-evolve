@@ -11,7 +11,7 @@ Available hooks (all optional — delete or leave unimplemented to use defaults)
 """
 
 
-def build_system_prompt(base_prompt: str, skills: list) -> str:
+def build_system_prompt(base_prompt: str, skills: list, task_prompt: str | None = None) -> str:
     """Assemble the system prompt.
 
     The default implementation returns the base prompt as-is.
