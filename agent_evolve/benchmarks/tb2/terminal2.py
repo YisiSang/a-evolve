@@ -13,8 +13,8 @@ import random
 from pathlib import Path
 from typing import Any
 
-from ..types import Feedback, Task, Trajectory
-from .base import BenchmarkAdapter
+from ...types import Feedback, Task, Trajectory
+from ..base import BenchmarkAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +129,7 @@ class Terminal2Benchmark(BenchmarkAdapter):
 
     def _do_split(self) -> None:
         """Load all challenges and partition into train + holdout."""
-        from ..agents.terminal.dataset import load_all_tasks
+        from ...agents.terminal.dataset import load_all_tasks
 
         all_tasks = load_all_tasks(self.challenges_dir)
         rows = []

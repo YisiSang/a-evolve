@@ -1,0 +1,41 @@
+# MetaHarness experiment on Terminal-Bench 2.0
+# Paper: "Meta-Harness: End-to-End Optimization of Model Harnesses"
+#        (Lee et al., 2026, arXiv:2603.28052)
+#
+# Settings match Section 4.3 + Appendix A:
+#   - 10 iterations, k=2 candidates per iteration
+#   - Full 89-task evaluation per candidate
+#   - Claude Opus 4.6 for both proposer and solver
+#   - No holdout (search + eval on same 89 tasks)
+#   - No rollback (Pareto frontier tracks best)
+
+# Core EvolveConfig fields
+batch_size: 89
+max_cycles: 10
+holdout_ratio: 0.0
+
+evolve_prompts: true
+evolve_skills: true
+evolve_memory: true
+evolve_tools: false
+
+evolver_model: us.anthropic.claude-opus-4-6-v1
+evolver_max_tokens: 16384
+
+egl_threshold: 0.02
+egl_window: 3
+
+# MetaHarnessEngine settings (passed via config.extra)
+harness_enabled: true
+proposer_model: us.anthropic.claude-opus-4-6-v1
+proposer_max_turns: 50
+proposer_timeout_sec: 900
+num_candidates: 2
+eval_sample_size: 0          # 0 = all 89 tasks (paper default). Set >0 for budget runs.
+rollback_on_regression: false
+
+# Solver / evaluation settings (consumed by run_metaharness.py)
+solver_model: us.anthropic.claude-opus-4-6-v1
+solver_region: us-west-2
+solver_max_tokens: 16384
+solve_workers: 6

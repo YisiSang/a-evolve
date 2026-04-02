@@ -243,21 +243,38 @@ class TerminalAgent(BaseAgent):
             container.copy_to(test_py_path, "/tests/test_outputs.py")
 
     @staticmethod
-    def _run_with_timeout(agent: Agent, prompt: str, timeout_sec: int):
-        """Run the agent with a wall-clock timeout."""
+    def _run_with_timeout(agent: Agent, prompt: str, timeout_sec: int, max_retries: int = 3):
+        """Run the agent with a wall-clock timeout and retry on transient errors."""
         def _run():
             return agent(prompt)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_run)
-            try:
-                return future.result(timeout=timeout_sec)
-            except concurrent.futures.TimeoutError:
-                logger.warning("Agent timed out after %ds", timeout_sec)
-                return None
-            except Exception as e:
-                logger.error("Agent exception: %s", str(e)[:200])
-                return None
+        for attempt in range(1, max_retries + 1):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run)
+                try:
+                    return future.result(timeout=timeout_sec)
+                except concurrent.futures.TimeoutError:
+                    logger.warning("Agent timed out after %ds", timeout_sec)
+                    return None
+                except Exception as e:
+                    err_str = str(e)[:200]
+                    is_transient = any(k in err_str for k in (
+                        "timed out", "Read timed out", "ThrottlingException",
+                        "ServiceUnavailableException", "TooManyRequestsException",
+                        "ConnectionError", "ConnectionReset",
+                    ))
+                    if is_transient and attempt < max_retries:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            "Transient error (attempt %d/%d), retrying in %ds: %s",
+                            attempt, max_retries, wait, err_str,
+                        )
+                        import time as _time
+                        _time.sleep(wait)
+                        continue
+                    logger.error("Agent exception: %s", err_str)
+                    return None
+        return None
 
 
 def _extract_conversation(messages: list) -> list[dict]:

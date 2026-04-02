@@ -31,8 +31,9 @@ from .prompts import PROPOSER_SYSTEM_PROMPT, build_proposer_prompt
 
 logger = logging.getLogger(__name__)
 
-# Default model: Bedrock Opus 4.6 (same as the paper)
-DEFAULT_MODEL = "bedrock:us.anthropic.claude-opus-4-6-v1"
+# Default model: Opus 4.6 via Claude Code CLI (same as the paper)
+# Note: Claude Code CLI uses raw Bedrock model IDs without the "bedrock:" prefix
+DEFAULT_MODEL = "us.anthropic.claude-opus-4-6-v1"
 
 # Workspace files to snapshot into each candidate archive
 _SNAPSHOT_DIRS = ("prompts", "skills", "memory", "tools")
@@ -93,6 +94,7 @@ class MetaHarnessEngine(EvolutionEngine):
         observations: list[Observation],
         history: EvolutionHistory,
         trial: TrialRunner,
+        tasks: list | None = None,
     ) -> StepResult:
         """Run one Meta-Harness evolution step (Algorithm 1 inner loop).
 
@@ -153,7 +155,7 @@ class MetaHarnessEngine(EvolutionEngine):
 
             if valid:
                 # Evaluate on benchmark tasks
-                eval_result = self._evaluate_candidate(trial)
+                eval_result = self._evaluate_candidate(trial, tasks=tasks)
                 score = eval_result["score"]
                 cost = eval_result["cost"]
             else:
@@ -337,23 +339,23 @@ class MetaHarnessEngine(EvolutionEngine):
     # ------------------------------------------------------------------
 
     def _evaluate_candidate(
-        self, trial: TrialRunner | None,
+        self, trial: TrialRunner | None, tasks: list | None = None,
     ) -> dict[str, Any]:
         """Evaluate a candidate on benchmark tasks.
 
         Returns dict with 'score' and 'cost' (total tokens).
-        When eval_sample_size=0, evaluates on all available tasks
-        (matching the paper's full-benchmark evaluation protocol).
+        If tasks are provided, uses them directly. Otherwise falls back
+        to loading from trial runner (eval_sample_size controls limit).
         """
         if trial is None:
             return {"score": 0.0, "cost": 0}
 
         try:
-            if self.eval_sample_size > 0:
-                tasks = trial.get_tasks(limit=self.eval_sample_size)
-            else:
-                # eval_sample_size=0: evaluate on all available tasks
-                tasks = trial.get_tasks(limit=10000)
+            if tasks is None:
+                if self.eval_sample_size > 0:
+                    tasks = trial.get_tasks(limit=self.eval_sample_size)
+                else:
+                    tasks = trial.get_tasks(limit=10000)
 
             if not tasks:
                 return {"score": 0.0, "cost": 0}
