@@ -30,7 +30,7 @@ rollback_on_regression: false
 solver_model: us.anthropic.claude-opus-4-6-v1
 solver_region: us-west-2
 solver_max_tokens: 16384
-solve_workers: 6
+solve_workers: 20
 agent_timeout_sec: 600
 
 # MCP-specific

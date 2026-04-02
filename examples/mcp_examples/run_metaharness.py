@@ -271,17 +271,18 @@ def run_evolution(
     config: EvolveConfig,
     tasks: list[Task] | None = None,
     eval_factory: Callable | None = None,
+    start_cycle: int = 1,
 ) -> float:
     """Run the MetaHarness search loop."""
     print(f"\n{'=' * 60}")
-    print(f"  PHASE 1: MetaHarness Evolution ({max_cycles} cycles, "
+    print(f"  PHASE 1: MetaHarness Evolution (cycles {start_cycle}-{max_cycles}, "
           f"k={engine.num_candidates})")
     print(f"{'=' * 60}\n")
 
     score_history = history.get_score_curve()
     best_score = max(score_history) if score_history else 0.0
 
-    for cycle in range(1, max_cycles + 1):
+    for cycle in range(start_cycle, max_cycles + 1):
         cycle_t0 = time.time()
         print(f"\n--- Cycle {cycle}/{max_cycles} "
               f"(best so far: {best_score:.3f}) ---")
@@ -457,6 +458,33 @@ def _append_history(evolution_dir: Path, cycle: int, score: float, mutated: bool
         f.write(json.dumps(entry) + "\n")
 
 
+def _load_resume_state(evolution_dir: Path) -> tuple[int, list[float]]:
+    """Load state from a previous run for resuming.
+
+    Returns (last_completed_cycle, score_curve).
+    Reads history.jsonl to reconstruct cycle records.
+    """
+    history_file = evolution_dir / "history.jsonl"
+    if not history_file.exists():
+        return 0, []
+
+    scores = []
+    last_cycle = 0
+    for line in history_file.read_text().strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+            cycle = entry["cycle"]
+            score = entry["score"]
+            scores.append(score)
+            last_cycle = max(last_cycle, cycle)
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    return last_cycle, scores
+
+
 def _write_metrics(evolution_dir: Path, scores: list[float]) -> None:
     metrics_file = evolution_dir / "metrics.json"
     metrics = {
@@ -503,6 +531,8 @@ def main():
                    help="Override MCP-Atlas Docker image")
     p.add_argument("--no-key-filter", action="store_true",
                    help="Don't filter tasks by available API keys")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume experiment from last completed cycle (skip baseline, continue evolution)")
     args = p.parse_args()
 
     # Logging
@@ -610,16 +640,37 @@ def main():
     run_phases = args.phase
     global_t0 = time.time()
     observations: list[Observation] = []
+    start_cycle = 1
+
+    # Resume: load state from previous run
+    if args.resume:
+        last_cycle, prev_scores = _load_resume_state(evolution_dir)
+        if last_cycle > 0:
+            start_cycle = last_cycle + 1
+            # Rebuild history cycle records so engines see prior scores
+            for i, score in enumerate(prev_scores):
+                history.record_cycle(CycleRecord(
+                    cycle=i if i == 0 else i,  # cycle 0 = baseline
+                    score=score,
+                    mutated=i > 0,
+                    engine_name="baseline" if i == 0 else "MetaHarnessEngine",
+                    summary=f"[resumed] cycle {i}: score={score:.3f}",
+                ))
+            print(f"\n  RESUMING from cycle {start_cycle} "
+                  f"(loaded {len(prev_scores)} prior scores, "
+                  f"best={max(prev_scores):.3f})")
+        else:
+            print("\n  --resume: no prior state found, starting fresh")
 
     try:
-        # Phase 0: Baseline
-        if run_phases in ("0", "all"):
+        # Phase 0: Baseline (skip if resuming with prior state)
+        if run_phases in ("0", "all") and start_cycle <= 1:
             observations = run_baseline(
                 agent, benchmark, trial, observer, versioning, history, all_tasks,
             )
 
         # Phase 1: Evolution
-        if run_phases in ("1", "all"):
+        if run_phases in ("1", "all") and start_cycle <= max_cycles:
             def _eval_factory(workspace_path: Path) -> ParallelMcpTrialRunner:
                 eval_agent = McpMHAgent(
                     workspace_dir=workspace_path,
@@ -640,6 +691,7 @@ def main():
                 engine, agent, trial, observer, versioning, history,
                 observations, max_cycles, config, tasks=all_tasks,
                 eval_factory=_eval_factory,
+                start_cycle=start_cycle,
             )
 
         # Select best candidate from archive before final eval (paper: "return Pareto frontier")
