@@ -85,7 +85,12 @@ class McpMHAgent(McpAgent):
         effective_image: str | None = task.metadata.get(
             "docker_image", self.docker_image
         )
-        enabled_tools: list[str] = task.metadata.get("enabled_tools", [])
+        raw_tools = task.metadata.get("enabled_tools", [])
+        enabled_tools: list[str] = [
+            t.get("name") if isinstance(t, dict) else str(t)
+            for t in raw_tools
+            if (isinstance(t, dict) and t.get("name")) or (not isinstance(t, dict))
+        ]
 
         env_vars: dict[str, str] = {}
         if self.key_registry:

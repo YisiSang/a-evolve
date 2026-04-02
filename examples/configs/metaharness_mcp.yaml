@@ -4,8 +4,8 @@
 #   - 10 evolution cycles, k=2 candidates per cycle
 #   - No holdout (search + eval on same tasks)
 #   - Claude Code CLI as proposer (Opus 4.6)
-#   - Claude Sonnet 4 as solver (via Bedrock)
-#   - LLM-as-judge evaluation (Gemini 2.5 Pro)
+#   - Claude Opus 4.6 as solver (via Bedrock)
+#   - Claude Opus 4.6 as judge (via Bedrock)
 
 batch_size: 500
 max_cycles: 10
@@ -27,13 +27,13 @@ eval_sample_size: 0        # 0 = all tasks. Set >0 for budget runs
 rollback_on_regression: false
 
 # Solver/eval extras
-solver_model: us.anthropic.claude-opus-4-5-20251101-v1:0
+solver_model: us.anthropic.claude-opus-4-6-v1
 solver_region: us-west-2
 solver_max_tokens: 16384
-solve_workers: 5
+solve_workers: 6
 agent_timeout_sec: 600
 
 # MCP-specific
 docker_image: ghcr.io/scaleapi/mcp-atlas:latest
-eval_model: us.anthropic.claude-opus-4-5-20251101-v1:0
+eval_model: us.anthropic.claude-opus-4-6-v1
 eval_use_litellm: false
