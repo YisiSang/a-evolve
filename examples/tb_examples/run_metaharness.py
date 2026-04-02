@@ -45,6 +45,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -234,6 +235,7 @@ def run_evolution(
     max_cycles: int,
     config: EvolveConfig,
     tasks: list[Task] | None = None,
+    eval_factory: Callable | None = None,
 ) -> float:
     """Run the MetaHarness search loop for max_cycles iterations."""
     print(f"\n{'=' * 60}")
@@ -256,6 +258,7 @@ def run_evolution(
             history=history,
             trial=trial,
             tasks=tasks,
+            eval_factory=eval_factory,
         )
 
         cycle_elapsed = time.time() - cycle_t0
@@ -518,9 +521,21 @@ def main():
 
         # Phase 1: Evolution
         if run_phases in ("1", "all"):
+            # Factory for parallel candidate evaluation: creates an
+            # independent (agent, trial_runner) pair for a workspace copy.
+            def _eval_factory(workspace_path: Path) -> ParallelTrialRunner:
+                eval_agent = TerminalMHAgent(
+                    workspace_dir=workspace_path,
+                    model_id=solver_model,
+                    region=solver_region,
+                    max_tokens=solver_max_tokens,
+                )
+                return ParallelTrialRunner(eval_agent, benchmark, max_workers=workers)
+
             best_score = run_evolution(
                 engine, agent, trial, observer, versioning, history,
                 observations, max_cycles, config, tasks=all_tasks,
+                eval_factory=_eval_factory,
             )
 
         # Phase 2: Final evaluation

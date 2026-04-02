@@ -13,6 +13,20 @@ Available hooks (all optional — delete or leave unimplemented to use defaults)
 import subprocess
 
 
+def build_system_prompt(base_prompt: str, skills: list) -> str:
+    """Assemble the system prompt.
+
+    The default implementation returns the base prompt as-is.
+    Skills are available in the skills/ directory but are NOT injected
+    into the prompt by default — the parent class's read_skill tool
+    does not exist in the solver's tool set.
+
+    The MetaHarness proposer can evolve this hook to incorporate
+    skill content, add strategies, or restructure the prompt.
+    """
+    return base_prompt
+
+
 def pre_solve(container_name: str) -> str:
     """Gather an environment snapshot before the agent loop starts.
 

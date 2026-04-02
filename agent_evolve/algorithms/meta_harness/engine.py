@@ -18,8 +18,10 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ...config import EvolveConfig
 from ...contract.workspace import AgentWorkspace
@@ -95,17 +97,25 @@ class MetaHarnessEngine(EvolutionEngine):
         history: EvolutionHistory,
         trial: TrialRunner,
         tasks: list | None = None,
+        eval_factory: Callable[[Path], TrialRunner] | None = None,
     ) -> StepResult:
         """Run one Meta-Harness evolution step (Algorithm 1 inner loop).
 
-        For each of k candidates:
-          1. Reset workspace to pre-mutation state
-          2. Run Claude Code proposer (mutates workspace files)
-          3. Validate candidate interface (syntax check before eval)
-          4. Evaluate on benchmark tasks (full or sampled)
-          5. Archive candidate to evolution/candidates/
+        Phase A — Propose (serial): for each of k candidates, run the
+        Claude Code proposer, capture the diff and snapshot, then reset.
 
-        Then select best candidate (Pareto-aware), apply or rollback.
+        Phase B — Evaluate (parallel when eval_factory is provided):
+        create temporary workspace copies, apply each candidate's diff,
+        and evaluate all candidates concurrently.
+
+        Phase C — Select: Pareto-aware selection, apply or rollback.
+
+        Args:
+            eval_factory: Optional callable ``(workspace_path) -> TrialRunner``.
+                When provided and num_candidates > 1, candidates are
+                evaluated in parallel using separate workspace copies.
+                When None, falls back to serial evaluation on the main
+                workspace (original behavior).
 
         Note: Initial population evaluation (Algorithm 1 lines 3-5) is
         handled by the A-Evolve loop's first SOLVE→OBSERVE cycle before
@@ -123,16 +133,19 @@ class MetaHarnessEngine(EvolutionEngine):
             d for d in candidates_dir.iterdir() if d.is_dir()
         ])
 
-        candidates: list[dict[str, Any]] = []
+        parallel = eval_factory is not None and self.num_candidates > 1
+
+        # ==============================================================
+        # Phase A — Propose all candidates (serial)
+        # ==============================================================
+        proposed: list[dict[str, Any]] = []
 
         for i in range(self.num_candidates):
-            # Reset workspace to pre-mutation state before each candidate
             if i > 0:
                 self._git_reset(workspace.root)
 
             cand_label = f"cycle_{cycle_num:03d}_cand_{i}"
 
-            # Build prompt — tells proposer where the archive is
             prompt = build_proposer_prompt(
                 workspace,
                 cycle_num,
@@ -140,53 +153,47 @@ class MetaHarnessEngine(EvolutionEngine):
                 harness_enabled=self.harness_enabled,
                 candidate_index=i,
                 num_candidates=self.num_candidates,
-                num_archived=existing + len(candidates),
+                num_archived=existing + len(proposed),
             )
 
-            # Run Claude Code proposer
             result = self._run_claude_code(prompt, workspace.root)
-
-            # Capture diff before archiving
             diff = self._git_diff(workspace.root)
-
-            # Interface validation (Algorithm 1 line 11):
-            # Check modified files are syntactically valid before eval
             valid, validation_err = self._validate_candidate(workspace)
 
-            if valid:
-                # Evaluate on benchmark tasks
-                eval_result = self._evaluate_candidate(trial, tasks=tasks)
-                score = eval_result["score"]
-                cost = eval_result["cost"]
-            else:
-                logger.warning(
-                    "Candidate %s failed validation: %s — skipping eval",
-                    cand_label, validation_err,
-                )
-                score = 0.0
-                cost = 0.0
+            # Snapshot workspace state for archiving (before reset)
+            snapshot_files = self._capture_snapshot(workspace)
 
-            # Archive this candidate to the growing filesystem
-            cand_dir = candidates_dir / cand_label
-            self._archive_candidate(
-                workspace, cand_dir, score, cost, cycle_num, i, result,
-                valid=valid, validation_err=validation_err,
-            )
-
-            candidates.append({
+            proposed.append({
                 "index": i,
                 "label": cand_label,
-                "score": score,
-                "cost": cost,
                 "diff": diff,
                 "valid": valid,
                 "validation_err": validation_err,
-                "exit_code": result.get("exit_code"),
-                "output_chars": len(result.get("output", "")),
+                "proposer_result": result,
+                "snapshot_files": snapshot_files,
             })
             logger.info(
-                "Candidate %s: valid=%s, score=%.3f, cost=%d (%d chars diff)",
-                cand_label, valid, score, cost, len(diff),
+                "Proposed %s: valid=%s (%d chars diff)",
+                cand_label, valid, len(diff),
+            )
+
+        # Reset workspace after all proposals
+        self._git_reset(workspace.root)
+
+        # ==============================================================
+        # Phase B — Evaluate candidates (parallel or serial)
+        # ==============================================================
+        candidates: list[dict[str, Any]] = []
+
+        if parallel:
+            candidates = self._evaluate_parallel(
+                proposed, workspace, candidates_dir, cycle_num,
+                eval_factory, tasks,
+            )
+        else:
+            candidates = self._evaluate_serial(
+                proposed, workspace, candidates_dir, cycle_num,
+                trial, tasks,
             )
 
         # -- Selection --
@@ -293,6 +300,266 @@ class MetaHarnessEngine(EvolutionEngine):
         )
 
     # ------------------------------------------------------------------
+    # Phase B helpers — serial and parallel evaluation
+    # ------------------------------------------------------------------
+
+    def _evaluate_serial(
+        self,
+        proposed: list[dict[str, Any]],
+        workspace: AgentWorkspace,
+        candidates_dir: Path,
+        cycle_num: int,
+        trial: TrialRunner,
+        tasks: list | None,
+    ) -> list[dict[str, Any]]:
+        """Evaluate candidates one at a time on the main workspace (original behavior)."""
+        candidates: list[dict[str, Any]] = []
+
+        for p in proposed:
+            # Apply this candidate's diff
+            if p["diff"]:
+                self._apply_diff(workspace.root, p["diff"])
+
+            if p["valid"]:
+                eval_result = self._evaluate_candidate(trial, tasks=tasks)
+                score = eval_result["score"]
+                cost = eval_result["cost"]
+            else:
+                logger.warning(
+                    "Candidate %s failed validation: %s — skipping eval",
+                    p["label"], p["validation_err"],
+                )
+                score = 0.0
+                cost = 0.0
+
+            # Archive
+            cand_dir = candidates_dir / p["label"]
+            self._archive_candidate_from_snapshot(
+                workspace, cand_dir, p["snapshot_files"],
+                score, cost, cycle_num, p["index"], p["proposer_result"],
+                valid=p["valid"], validation_err=p["validation_err"],
+            )
+
+            candidates.append({
+                "index": p["index"],
+                "label": p["label"],
+                "score": score,
+                "cost": cost,
+                "diff": p["diff"],
+                "valid": p["valid"],
+                "validation_err": p["validation_err"],
+                "exit_code": p["proposer_result"].get("exit_code"),
+                "output_chars": len(p["proposer_result"].get("output", "")),
+            })
+            logger.info(
+                "Candidate %s: valid=%s, score=%.3f, cost=%d",
+                p["label"], p["valid"], score, cost,
+            )
+
+            # Reset before next candidate
+            self._git_reset(workspace.root)
+
+        return candidates
+
+    def _evaluate_parallel(
+        self,
+        proposed: list[dict[str, Any]],
+        workspace: AgentWorkspace,
+        candidates_dir: Path,
+        cycle_num: int,
+        eval_factory: Callable[[Path], TrialRunner],
+        tasks: list | None,
+    ) -> list[dict[str, Any]]:
+        """Evaluate candidates in parallel using temporary workspace copies."""
+        valid_proposals = [p for p in proposed if p["valid"]]
+        invalid_proposals = [p for p in proposed if not p["valid"]]
+
+        # Handle invalid candidates immediately
+        candidates: list[dict[str, Any]] = []
+        for p in invalid_proposals:
+            logger.warning(
+                "Candidate %s failed validation: %s — skipping eval",
+                p["label"], p["validation_err"],
+            )
+            cand_dir = candidates_dir / p["label"]
+            self._archive_candidate_from_snapshot(
+                workspace, cand_dir, p["snapshot_files"],
+                0.0, 0.0, cycle_num, p["index"], p["proposer_result"],
+                valid=False, validation_err=p["validation_err"],
+            )
+            candidates.append({
+                "index": p["index"],
+                "label": p["label"],
+                "score": 0.0,
+                "cost": 0.0,
+                "diff": p["diff"],
+                "valid": False,
+                "validation_err": p["validation_err"],
+                "exit_code": p["proposer_result"].get("exit_code"),
+                "output_chars": len(p["proposer_result"].get("output", "")),
+            })
+
+        if not valid_proposals:
+            return candidates
+
+        # Create temp workspace copies and evaluate in parallel
+        tmp_dirs: list[Path] = []
+
+        def _eval_one(p: dict[str, Any]) -> dict[str, Any]:
+            tmp_root = Path(tempfile.mkdtemp(prefix=f"mh_{p['label']}_"))
+            tmp_dirs.append(tmp_root)
+            tmp_workspace = tmp_root / "workspace"
+            shutil.copytree(workspace.root, tmp_workspace)
+
+            if p["diff"]:
+                self._apply_diff(tmp_workspace, p["diff"])
+
+            eval_trial = eval_factory(tmp_workspace)
+            eval_result = self._evaluate_candidate(eval_trial, tasks=tasks)
+
+            return {
+                "index": p["index"],
+                "label": p["label"],
+                "score": eval_result["score"],
+                "cost": eval_result["cost"],
+                "diff": p["diff"],
+                "valid": True,
+                "validation_err": "",
+                "exit_code": p["proposer_result"].get("exit_code"),
+                "output_chars": len(p["proposer_result"].get("output", "")),
+                "snapshot_files": p["snapshot_files"],
+                "proposer_result": p["proposer_result"],
+            }
+
+        logger.info(
+            "Evaluating %d candidates in parallel",
+            len(valid_proposals),
+        )
+
+        try:
+            with ThreadPoolExecutor(max_workers=len(valid_proposals)) as pool:
+                futures = {
+                    pool.submit(_eval_one, p): p for p in valid_proposals
+                }
+                for future in as_completed(futures):
+                    p = futures[future]
+                    try:
+                        result = future.result()
+                        # Archive
+                        cand_dir = candidates_dir / result["label"]
+                        self._archive_candidate_from_snapshot(
+                            workspace, cand_dir, result["snapshot_files"],
+                            result["score"], result["cost"],
+                            cycle_num, result["index"], result["proposer_result"],
+                            valid=True, validation_err="",
+                        )
+                        candidates.append(result)
+                        logger.info(
+                            "Candidate %s: score=%.3f, cost=%d",
+                            result["label"], result["score"], result["cost"],
+                        )
+                    except Exception as e:
+                        logger.error("Parallel eval failed for %s: %s", p["label"], e)
+                        candidates.append({
+                            "index": p["index"],
+                            "label": p["label"],
+                            "score": 0.0,
+                            "cost": 0.0,
+                            "diff": p["diff"],
+                            "valid": True,
+                            "validation_err": f"eval_error: {e}",
+                            "exit_code": p["proposer_result"].get("exit_code"),
+                            "output_chars": len(p["proposer_result"].get("output", "")),
+                        })
+        finally:
+            # Cleanup temp directories
+            for tmp_dir in tmp_dirs:
+                try:
+                    shutil.rmtree(tmp_dir)
+                except Exception:
+                    pass
+
+        return candidates
+
+    # ------------------------------------------------------------------
+    # Snapshot helpers
+    # ------------------------------------------------------------------
+
+    def _capture_snapshot(self, workspace: AgentWorkspace) -> dict[str, bytes]:
+        """Capture mutable workspace files as in-memory bytes for later archiving."""
+        snapshot: dict[str, bytes] = {}
+        for dirname in _SNAPSHOT_DIRS:
+            src = workspace.root / dirname
+            if src.exists():
+                for f in src.rglob("*"):
+                    if f.is_file():
+                        rel = str(f.relative_to(workspace.root))
+                        snapshot[rel] = f.read_bytes()
+        for fname in _SNAPSHOT_FILES:
+            src = workspace.root / fname
+            if src.exists():
+                snapshot[fname] = src.read_bytes()
+        return snapshot
+
+    def _archive_candidate_from_snapshot(
+        self,
+        workspace: AgentWorkspace,
+        cand_dir: Path,
+        snapshot_files: dict[str, bytes],
+        score: float,
+        cost: int | float,
+        cycle: int,
+        cand_index: int,
+        proposer_result: dict[str, Any],
+        *,
+        valid: bool = True,
+        validation_err: str = "",
+    ) -> None:
+        """Archive a candidate using a pre-captured snapshot."""
+        cand_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Write snapshot files
+        snapshot_dir = cand_dir / "snapshot"
+        snapshot_dir.mkdir(exist_ok=True)
+        for rel_path, content in snapshot_files.items():
+            dest = snapshot_dir / rel_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(content)
+
+        # 2. Write scores + metadata
+        scores_data = {
+            "cycle": cycle,
+            "candidate_index": cand_index,
+            "score": score,
+            "cost": cost,
+            "valid": valid,
+            "validation_error": validation_err,
+            "selected": False,
+            "pareto_optimal": False,
+            "proposer_model": self.model,
+            "proposer_exit_code": proposer_result.get("exit_code"),
+        }
+        (cand_dir / "scores.json").write_text(
+            json.dumps(scores_data, indent=2)
+        )
+
+        # 3. Link traces
+        traces_dir = cand_dir / "traces"
+        traces_dir.mkdir(exist_ok=True)
+        obs_dir = workspace.root / "evolution" / "observations"
+        if obs_dir.exists():
+            batches = sorted(obs_dir.glob("batch_*.jsonl"))
+            if batches:
+                latest_batch = batches[-1]
+                link_target = traces_dir / latest_batch.name
+                try:
+                    link_target.symlink_to(latest_batch.resolve())
+                except OSError:
+                    shutil.copy2(latest_batch, link_target)
+
+        logger.debug("Archived candidate to %s", cand_dir)
+
+    # ------------------------------------------------------------------
     # Interface validation (Algorithm 1 line 11)
     # ------------------------------------------------------------------
 
@@ -379,81 +646,7 @@ class MetaHarnessEngine(EvolutionEngine):
             logger.warning("Evaluation failed: %s", e)
             return {"score": 0.0, "cost": 0}
 
-    # ------------------------------------------------------------------
-    # Candidate archiving — the growing filesystem
-    # ------------------------------------------------------------------
 
-    def _archive_candidate(
-        self,
-        workspace: AgentWorkspace,
-        cand_dir: Path,
-        score: float,
-        cost: int,
-        cycle: int,
-        cand_index: int,
-        proposer_result: dict[str, Any],
-        *,
-        valid: bool = True,
-        validation_err: str = "",
-    ) -> None:
-        """Archive a candidate's workspace snapshot + scores + traces.
-
-        Creates::
-            cand_dir/
-            ├── snapshot/          # copies of mutable workspace files
-            ├── scores.json        # evaluation score, cost, validation, metadata
-            └── traces/            # symlink to observation batch
-        """
-        cand_dir.mkdir(parents=True, exist_ok=True)
-
-        # 1. Snapshot mutable workspace files
-        snapshot_dir = cand_dir / "snapshot"
-        snapshot_dir.mkdir(exist_ok=True)
-
-        for dirname in _SNAPSHOT_DIRS:
-            src = workspace.root / dirname
-            dst = snapshot_dir / dirname
-            if src.exists():
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-
-        for fname in _SNAPSHOT_FILES:
-            src = workspace.root / fname
-            if src.exists():
-                shutil.copy2(src, snapshot_dir / fname)
-
-        # 2. Write scores + metadata
-        scores_data = {
-            "cycle": cycle,
-            "candidate_index": cand_index,
-            "score": score,
-            "cost": cost,
-            "valid": valid,
-            "validation_error": validation_err,
-            "selected": False,
-            "pareto_optimal": False,
-            "proposer_model": self.model,
-            "proposer_exit_code": proposer_result.get("exit_code"),
-        }
-        (cand_dir / "scores.json").write_text(
-            json.dumps(scores_data, indent=2)
-        )
-
-        # 3. Link traces — find the most recent observation batch
-        traces_dir = cand_dir / "traces"
-        traces_dir.mkdir(exist_ok=True)
-        obs_dir = workspace.root / "evolution" / "observations"
-        if obs_dir.exists():
-            batches = sorted(obs_dir.glob("batch_*.jsonl"))
-            if batches:
-                latest_batch = batches[-1]
-                link_target = traces_dir / latest_batch.name
-                try:
-                    link_target.symlink_to(latest_batch.resolve())
-                except OSError:
-                    # Fallback: copy if symlink fails
-                    shutil.copy2(latest_batch, link_target)
-
-        logger.debug("Archived candidate to %s", cand_dir)
 
     # ------------------------------------------------------------------
     # Claude Code CLI invocation
