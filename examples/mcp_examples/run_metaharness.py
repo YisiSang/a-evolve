@@ -462,27 +462,117 @@ def _load_resume_state(evolution_dir: Path) -> tuple[int, list[float]]:
     """Load state from a previous run for resuming.
 
     Returns (last_completed_cycle, score_curve).
-    Reads history.jsonl to reconstruct cycle records.
+    Uses two sources: history.jsonl for recorded cycles, and candidates/
+    directory as fallback (since history.jsonl may be incomplete).
     """
+    # Source 1: history.jsonl
+    history_scores: dict[int, float] = {}
     history_file = evolution_dir / "history.jsonl"
-    if not history_file.exists():
+    if history_file.exists():
+        for line in history_file.read_text().strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+                history_scores[entry["cycle"]] = entry["score"]
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    # Source 2: candidates directory (more reliable — always written by engine)
+    candidates_dir = evolution_dir / "candidates"
+    candidate_cycles: dict[int, float] = {}
+    if candidates_dir.exists():
+        for scores_path in candidates_dir.glob("*/scores.json"):
+            label = scores_path.parent.name  # e.g. "cycle_003_cand_1"
+            try:
+                cycle_num = int(label.split("_")[1])
+                data = json.loads(scores_path.read_text())
+                score = data.get("score", 0.0)
+                # Keep the best candidate score per cycle
+                if cycle_num not in candidate_cycles or score > candidate_cycles[cycle_num]:
+                    candidate_cycles[cycle_num] = score
+            except (ValueError, json.JSONDecodeError, KeyError, IndexError):
+                continue
+
+    # Merge: use history for baseline (cycle 0), candidates for evolution cycles
+    all_scores: dict[int, float] = {}
+    all_scores.update(history_scores)
+    for cycle_num, score in candidate_cycles.items():
+        if cycle_num not in all_scores:
+            all_scores[cycle_num] = score
+
+    if not all_scores:
         return 0, []
 
-    scores = []
-    last_cycle = 0
-    for line in history_file.read_text().strip().split("\n"):
-        if not line.strip():
-            continue
-        try:
-            entry = json.loads(line)
-            cycle = entry["cycle"]
-            score = entry["score"]
-            scores.append(score)
-            last_cycle = max(last_cycle, cycle)
-        except (json.JSONDecodeError, KeyError):
-            continue
+    last_cycle = max(all_scores.keys())
+    score_curve = [all_scores.get(i, 0.0) for i in range(min(all_scores.keys()), last_cycle + 1)]
+    return last_cycle, score_curve
 
-    return last_cycle, scores
+
+def _export_artifact(
+    work_dir: Path,
+    run_name: str,
+    baseline_metrics: dict | None,
+    final_metrics: dict | None,
+    config_path: str,
+    meta: dict,
+) -> Path:
+    """Export the best candidate's snapshot as a clean artifact folder.
+
+    Outputs to artifacts/mcp_mh_<run_name>/ under the repo root.
+    """
+    # Find repo root (parent of examples/)
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    artifact_dir = repo_root / "artifacts" / f"mcp_mh_{run_name}"
+
+    # Clean previous artifact if any
+    if artifact_dir.exists():
+        shutil.rmtree(artifact_dir)
+    artifact_dir.mkdir(parents=True)
+
+    # Find best candidate from archive
+    candidates_dir = work_dir / "evolution" / "candidates"
+    best_label, best_score, best_cost, best_snapshot = None, -1.0, 0, None
+    if candidates_dir.exists():
+        for scores_path in candidates_dir.glob("*/scores.json"):
+            try:
+                data = json.loads(scores_path.read_text())
+                if not data.get("valid", True):
+                    continue
+                score = data.get("score", 0.0)
+                if score > best_score:
+                    best_score = score
+                    best_cost = data.get("cost", 0)
+                    best_label = scores_path.parent.name
+                    best_snapshot = scores_path.parent / "snapshot"
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    if not best_snapshot or not best_snapshot.exists():
+        log.warning("No valid snapshot found — artifact not created")
+        return artifact_dir
+
+    # Copy snapshot contents to artifact root
+    for item in best_snapshot.iterdir():
+        dest = artifact_dir / item.name
+        if item.is_dir():
+            shutil.copytree(item, dest)
+        else:
+            shutil.copy2(item, dest)
+
+    # Write results.json
+    results = {
+        "best_candidate": best_label,
+        "best_search_score": best_score,
+        "best_search_cost": best_cost,
+        "baseline": baseline_metrics,
+        "final_eval": final_metrics,
+        **meta,
+    }
+    (artifact_dir / "results.json").write_text(json.dumps(results, indent=2))
+
+    print(f"\n  Artifact exported to {artifact_dir}")
+    return artifact_dir
 
 
 def _write_metrics(evolution_dir: Path, scores: list[float]) -> None:
@@ -535,14 +625,20 @@ def main():
                    help="Resume experiment from last completed cycle (skip baseline, continue evolution)")
     args = p.parse_args()
 
-    # Logging
+    # Logging — console shows only experiment-level progress (WARNING+),
+    # full debug log goes to evolution/experiment.log
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Our own loggers stay at INFO on console
+    for name in ("metaharness_mcp", "agent_evolve.algorithms.meta_harness"):
+        logging.getLogger(name).setLevel(logging.INFO)
+    # Suppress noisy libraries
     for n in ("botocore", "urllib3", "httpcore", "httpx",
-              "strands.models", "strands.tools", "strands.telemetry"):
+              "strands.models", "strands.tools", "strands.telemetry",
+              "strands.tools.executors"):
         logging.getLogger(n).setLevel(logging.WARNING)
 
     # Load config
@@ -608,6 +704,15 @@ def main():
 
     evolution_dir = work_dir / "evolution"
     evolution_dir.mkdir(parents=True, exist_ok=True)
+
+    # File handler — full debug log to evolution/experiment.log
+    file_handler = logging.FileHandler(evolution_dir / "experiment.log")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S",
+    ))
+    logging.getLogger().addHandler(file_handler)
+
     observer = Observer(evolution_dir)
     versioning = VersionControl(work_dir)
     versioning.init()
@@ -699,13 +804,44 @@ def main():
             _restore_best_candidate(work_dir, agent)
 
             final_obs = run_final_eval(agent, trial, observer, all_tasks)
+            final_metrics = compute_metrics(final_obs)
 
             baseline_scores = history.get_score_curve()
+            baseline_metrics = None
             if baseline_scores:
                 baseline = baseline_scores[0]
-                final = sum(o.feedback.score for o in final_obs) / len(final_obs) if final_obs else 0.0
-                print(f"\n  Baseline: {baseline:.3f} -> Final: {final:.3f} "
-                      f"(delta: {final - baseline:+.3f})")
+                final_score = sum(o.feedback.score for o in final_obs) / len(final_obs) if final_obs else 0.0
+                print(f"\n  Baseline: {baseline:.3f} -> Final: {final_score:.3f} "
+                      f"(delta: {final_score - baseline:+.3f})")
+
+            # Compute baseline metrics from first observation batch
+            baseline_batch = evolution_dir / "observations" / "batch_0001.jsonl"
+            if baseline_batch.exists():
+                bl_obs_raw = [json.loads(l) for l in baseline_batch.read_text().strip().split("\n") if l.strip()]
+                bl_total = len(bl_obs_raw)
+                bl_passed = sum(1 for o in bl_obs_raw if o.get("success", False))
+                bl_avg = sum(o.get("score", 0) for o in bl_obs_raw) / bl_total if bl_total else 0
+                baseline_metrics = {"total": bl_total, "passed": bl_passed,
+                                    "pass_rate": bl_passed / bl_total if bl_total else 0,
+                                    "avg_score": bl_avg}
+
+            # Export clean artifact
+            _export_artifact(
+                work_dir=work_dir,
+                run_name=args.run_name,
+                baseline_metrics=baseline_metrics,
+                final_metrics=final_metrics,
+                config_path=args.config,
+                meta={
+                    "solver_model": solver_model,
+                    "proposer_model": engine.model,
+                    "eval_model": eval_model,
+                    "max_cycles": max_cycles,
+                    "num_candidates": engine.num_candidates,
+                    "num_tasks": len(all_tasks),
+                    "timestamp": datetime.now().isoformat(),
+                },
+            )
 
     except KeyboardInterrupt:
         print("\n\nInterrupted! Cleaning up...")

@@ -42,6 +42,21 @@ logger = logging.getLogger(__name__)
 class McpMHAgent(McpAgent):
     """MCP tool-calling agent with dynamic harness.py hook support."""
 
+    def _build_strands_agent(self, tools: list, task_prompt: str | None = None) -> Agent:
+        model = BedrockModel(
+            model_id=self.model_id,
+            region_name=self.region,
+            max_tokens=self.max_tokens,
+        )
+        system_prompt = self._build_system_prompt(task_prompt=task_prompt)
+        return Agent(
+            model=model,
+            system_prompt=system_prompt,
+            tools=tools,
+            conversation_manager=PinnedFirstMessageManager(),
+            callback_handler=None,  # suppress agent stdout noise in logs
+        )
+
     def _build_system_prompt(self, task_prompt: str | None = None) -> str:
         hook = self.harness_hook("build_system_prompt")
         if hook:

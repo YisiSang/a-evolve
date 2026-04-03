@@ -808,9 +808,11 @@ class MetaHarnessEngine(EvolutionEngine):
         """Reset workspace to last committed state (discard uncommitted changes).
 
         Preserves evolution/ directory (observations + candidate archive).
+        Uses pathspec to exclude evolution/ from checkout so that files like
+        history.jsonl and metrics.json are not reverted.
         """
         subprocess.run(
-            ["git", "checkout", "."],
+            ["git", "checkout", "--", ":(exclude)evolution"],
             cwd=str(root),
             capture_output=True,
         )
