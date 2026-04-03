@@ -29,7 +29,7 @@ from ...engine.base import EvolutionEngine
 from ...engine.history import EvolutionHistory
 from ...engine.trial import TrialRunner
 from ...types import Observation, StepResult
-from .prompts import PROPOSER_SYSTEM_PROMPT, build_proposer_prompt
+from .prompts import build_proposer_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "us.anthropic.claude-opus-4-6-v1"
 
 # Workspace files to snapshot into each candidate archive
-_SNAPSHOT_DIRS = ("prompts", "skills", "memory", "tools")
-_SNAPSHOT_FILES = ("harness.py",)
+_SNAPSHOT_DIRS = ("prompts", "skills", "memory", "tools", ".claude")
+_SNAPSHOT_FILES = ("harness.py", "CLAUDE.md")
 
 
 class MetaHarnessEngine(EvolutionEngine):
@@ -159,6 +159,19 @@ class MetaHarnessEngine(EvolutionEngine):
             result = self._run_claude_code(prompt, workspace.root)
             diff = self._git_diff(workspace.root)
             valid, validation_err = self._validate_candidate(workspace)
+
+            # Regex audit for task-specific string leakage (paper §4.3)
+            task_ids = [t.id for t in tasks] if tasks else []
+            leakage = self._audit_leakage(workspace, task_ids)
+            if leakage:
+                logger.warning(
+                    "Leakage audit for %s: %s", cand_label, "; ".join(leakage),
+                )
+                valid = False
+                validation_err = (
+                    (validation_err + "; " if validation_err else "")
+                    + "leakage: " + "; ".join(leakage)
+                )
 
             # Snapshot workspace state for archiving (before reset)
             snapshot_files = self._capture_snapshot(workspace)
@@ -601,6 +614,53 @@ class MetaHarnessEngine(EvolutionEngine):
             return False, "; ".join(errors)
         return True, ""
 
+    def _audit_leakage(
+        self,
+        workspace: AgentWorkspace,
+        task_ids: list[str],
+    ) -> list[str]:
+        """Regex audit for task-specific string leakage (paper §4.3).
+
+        Scans workspace files (prompts, skills, harness, tools) for
+        hardcoded task IDs.  Returns list of warnings (empty = clean).
+        """
+        if not task_ids:
+            return []
+
+        import re
+
+        # Collect text from all mutable workspace files
+        texts: list[tuple[str, str]] = []  # (filename, content)
+        for d in _SNAPSHOT_DIRS:
+            d_path = workspace.root / d
+            if d_path.exists():
+                for f in d_path.rglob("*"):
+                    if f.is_file():
+                        try:
+                            texts.append((str(f.relative_to(workspace.root)), f.read_text()))
+                        except (UnicodeDecodeError, OSError):
+                            pass
+        for f_name in _SNAPSHOT_FILES:
+            f_path = workspace.root / f_name
+            if f_path.exists():
+                try:
+                    texts.append((f_name, f_path.read_text()))
+                except (UnicodeDecodeError, OSError):
+                    pass
+
+        warnings: list[str] = []
+        for task_id in task_ids:
+            # Skip very short IDs that would cause false positives
+            if len(task_id) < 8:
+                continue
+            pattern = re.escape(task_id)
+            for filename, content in texts:
+                if re.search(pattern, content):
+                    warnings.append(f"task ID '{task_id}' found in {filename}")
+                    break  # one warning per task ID
+
+        return warnings
+
     # ------------------------------------------------------------------
     # Candidate evaluation
     # ------------------------------------------------------------------
@@ -657,21 +717,23 @@ class MetaHarnessEngine(EvolutionEngine):
 
         Runs in non-interactive mode (-p) with:
           - --model: Bedrock Opus 4.6
-          - --system-prompt: minimal Meta-Harness skill
           - --max-turns: bounded exploration
           - --dangerously-skip-permissions: no interactive approval
-          - cwd: workspace root (Claude Code sees the full tree)
+          - cwd: workspace root (Claude Code discovers CLAUDE.md as skill)
+
+        The proposer's skill is defined in CLAUDE.md at the workspace root,
+        following the paper's approach (Appendix D): Claude Code's native
+        skill discovery loads CLAUDE.md automatically, replacing the old
+        --bare --system-prompt approach.
         """
         cmd = [
             "claude",
             "-p", prompt,
             "--model", self.model,
-            "--system-prompt", PROPOSER_SYSTEM_PROMPT,
             "--max-turns", str(self.max_turns),
             "--dangerously-skip-permissions",
             "--output-format", "json",
             "--no-session-persistence",
-            "--bare",
         ]
 
         logger.info(
@@ -746,9 +808,11 @@ class MetaHarnessEngine(EvolutionEngine):
         """Reset workspace to last committed state (discard uncommitted changes).
 
         Preserves evolution/ directory (observations + candidate archive).
+        Uses pathspec to exclude evolution/ from checkout so that files like
+        history.jsonl and metrics.json are not reverted.
         """
         subprocess.run(
-            ["git", "checkout", "."],
+            ["git", "checkout", "--", ":(exclude)evolution"],
             cwd=str(root),
             capture_output=True,
         )

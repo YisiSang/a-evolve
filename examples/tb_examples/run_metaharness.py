@@ -308,6 +308,83 @@ def run_evolution(
 # Phase 2 — Final evaluation
 # ---------------------------------------------------------------------------
 
+def _restore_best_candidate(work_dir: Path, agent: TerminalMHAgent) -> None:
+    """Select the best candidate from the archive and restore its snapshot.
+
+    Implements the paper's "return Pareto frontier" step: scan all candidates,
+    compute the Pareto frontier across (score↑, cost↓), select the highest-
+    scoring candidate on the frontier, and copy its snapshot/ files into the
+    workspace so Phase 2 evaluates the best harness rather than the last one.
+    """
+    candidates_dir = work_dir / "evolution" / "candidates"
+    if not candidates_dir.exists():
+        log.warning("No candidates directory found at %s — skipping archive selection", candidates_dir)
+        return
+
+    # Load all candidate scores
+    candidates = []
+    for scores_path in sorted(candidates_dir.glob("*/scores.json")):
+        try:
+            data = json.loads(scores_path.read_text())
+            if not data.get("valid", True):
+                continue
+            candidates.append({
+                "label": scores_path.parent.name,
+                "score": data.get("score", 0.0),
+                "cost": data.get("cost", 0),
+                "snapshot_dir": scores_path.parent / "snapshot",
+            })
+        except (json.JSONDecodeError, KeyError) as exc:
+            log.warning("Skipping %s: %s", scores_path, exc)
+
+    if not candidates:
+        log.warning("No valid candidates found in archive — skipping")
+        return
+
+    # Compute Pareto frontier (maximize score, minimize cost)
+    frontier = []
+    for c in candidates:
+        dominated = False
+        for other in candidates:
+            if other is c:
+                continue
+            if (other["score"] >= c["score"]
+                    and other["cost"] <= c["cost"]
+                    and (other["score"] > c["score"]
+                         or other["cost"] < c["cost"])):
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(c)
+
+    best = max(frontier, key=lambda c: c["score"])
+    snapshot_dir = best["snapshot_dir"]
+
+    print(f"\n  Archive selection: {best['label']} "
+          f"(score={best['score']:.3f}, cost={best['cost']}) "
+          f"from {len(candidates)} candidates ({len(frontier)} on Pareto frontier)")
+
+    if not snapshot_dir.exists():
+        log.error("Snapshot directory %s does not exist", snapshot_dir)
+        return
+
+    # Restore snapshot files into workspace
+    workspace_root = agent.workspace.root
+    for item in snapshot_dir.iterdir():
+        dest = workspace_root / item.name
+        if item.is_dir():
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(item, dest)
+        else:
+            shutil.copy2(item, dest)
+    log.info("Restored snapshot from %s to %s", snapshot_dir, workspace_root)
+
+    # Reload agent state from the restored workspace
+    agent.reload_from_fs()
+    print(f"  Agent reloaded from best candidate's snapshot\n")
+
+
 def run_final_eval(
     agent: TerminalMHAgent,
     trial: ParallelTrialRunner,
@@ -538,8 +615,10 @@ def main():
                 eval_factory=_eval_factory,
             )
 
-        # Phase 2: Final evaluation
+        # Select best candidate from archive before final eval (paper: "return Pareto frontier")
         if run_phases in ("2", "all"):
+            _restore_best_candidate(work_dir, agent)
+
             final_obs = run_final_eval(agent, trial, observer, all_tasks)
 
             # Compare baseline vs evolved
