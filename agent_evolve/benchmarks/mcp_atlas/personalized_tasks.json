@@ -1,0 +1,464 @@
+{
+  "version": "0.1.0",
+  "description": "Open-ended tasks for personalized harness evaluation. Each task uses MCP-Atlas infrastructure (same Docker image, same MCP servers) but has persona-dependent claims instead of fixed factual claims.",
+  "tasks": [
+    {
+      "id": "personal_001",
+      "prompt": "Analyze the crime dataset in my local files and write a report on fraud trends. Include any patterns you find regarding how fraud is committed, who the typical victims and suspects are, and how this has changed over time.",
+      "enabled_tools": ["mcp-code-executor_execute", "cli-mcp-server_run_command", "filesystem_read_file", "filesystem_list_directory"],
+      "mcp_server_names": ["mcp-code-executor", "cli-mcp-server", "filesystem"],
+      "category": "data_analysis",
+      "base_claims": [
+        "The response references the crime dataset from local files",
+        "The response includes information about fraud crimes specifically",
+        "The response mentions patterns related to victims or suspects"
+      ],
+      "persona_claims": {
+        "exec": [
+          "The response is concise (under 200 words of prose, excluding tables)",
+          "Key findings are presented as bullet points or a summary table",
+          "The response includes a clear bottom-line takeaway or recommendation",
+          "No code or methodology details are shown"
+        ],
+        "ds": [
+          "The response shows the code or queries used to analyze the data",
+          "Statistical measures are included (counts, percentages, averages, or trends)",
+          "The response mentions data quality issues or caveats if any exist",
+          "The analysis methodology is explained (e.g., how fraud was filtered, what time periods were compared)",
+          "Results are presented in a table or structured format"
+        ],
+        "junior": [
+          "The response explains the approach step by step before showing results",
+          "Technical terms (e.g., fraud categories, age distributions) are defined or explained",
+          "The response explains WHY certain patterns might exist, not just what they are",
+          "The analysis is structured with clear sections or headings"
+        ],
+        "journalist": [
+          "The response frames findings as a narrative with a compelling lead",
+          "Concrete examples or representative cases are highlighted",
+          "The human impact of fraud trends is mentioned",
+          "Sources or data provenance are cited"
+        ]
+      }
+    },
+    {
+      "id": "personal_002",
+      "prompt": "Review the repositories on my computer and give me a summary of recent development activity across all projects. I want to understand which projects are most active, who the key contributors are, and what kinds of changes are being made.",
+      "enabled_tools": ["git_git_log", "git_git_diff", "git_git_remote", "git_git_tag", "filesystem_list_directory", "filesystem_read_file", "cli-mcp-server_run_command"],
+      "mcp_server_names": ["git", "filesystem", "cli-mcp-server"],
+      "category": "git_analysis",
+      "base_claims": [
+        "The response references at least 2 repositories found on the local machine",
+        "The response includes information about commit activity or contributors",
+        "The response compares or ranks projects by some measure of activity"
+      ],
+      "persona_claims": {
+        "exec": [
+          "The summary fits in a single screen (under 150 words of prose)",
+          "Projects are ranked by activity level in a table or list",
+          "A clear recommendation or highlight of the most important project is given",
+          "No commit hashes or technical git details are shown"
+        ],
+        "ds": [
+          "Quantitative metrics are provided (commit counts, contributor counts, date ranges)",
+          "The methodology for measuring activity is explained",
+          "Data is presented in a structured table format",
+          "Full commit hashes or URLs are included for traceability"
+        ],
+        "junior": [
+          "The response explains what each repository is about before analyzing it",
+          "Git concepts (commits, contributors, branches) are explained in context",
+          "The analysis walks through the process of examining each repo",
+          "The summary includes context about what makes a project 'active'"
+        ],
+        "journalist": [
+          "The summary tells a story about the development team's focus areas",
+          "Specific notable changes or milestones are highlighted as examples",
+          "The narrative connects technical activity to broader project goals",
+          "Key contributors are mentioned by name with their roles"
+        ]
+      }
+    },
+    {
+      "id": "personal_003",
+      "prompt": "Research the artwork 'The Musicians' at the Metropolitan Museum of Art. I want to know about the artist, the historical context of the painting, and its significance in art history.",
+      "enabled_tools": ["met-museum_search-museum-objects", "met-museum_get-museum-object", "wikipedia_get_page_summary", "wikipedia_search_wikipedia", "ddg-search_search"],
+      "mcp_server_names": ["met-museum", "wikipedia", "ddg-search"],
+      "category": "research",
+      "base_claims": [
+        "The response identifies the artist of The Musicians (Caravaggio)",
+        "The response includes historical context about when the painting was created",
+        "The response discusses the painting's significance or artistic importance"
+      ],
+      "persona_claims": {
+        "exec": [
+          "The response is a brief overview (under 150 words)",
+          "Key facts are presented as bullet points",
+          "The significance is summarized in one clear sentence",
+          "No detailed art history analysis is included"
+        ],
+        "ds": [
+          "Specific dates, dimensions, or catalog numbers are included",
+          "Multiple sources are cross-referenced",
+          "The response distinguishes between established facts and interpretations",
+          "Information is organized in a structured format with clear categories"
+        ],
+        "junior": [
+          "The response provides background on the artist before discussing the specific painting",
+          "Art history terms (e.g., Baroque, chiaroscuro) are explained when used",
+          "The response explains WHY this painting is considered significant",
+          "The narrative is structured chronologically or thematically with clear flow"
+        ],
+        "journalist": [
+          "The response opens with a compelling hook or interesting fact about the painting",
+          "The human story behind the artwork is emphasized (artist's life, circumstances of creation)",
+          "Visual descriptions help the reader imagine the painting",
+          "The response connects the historical artwork to something a modern reader can relate to"
+        ]
+      }
+    },
+    {
+      "id": "personal_004",
+      "prompt": "I have some financial data in my cloud database. Look into the purchase records and give me an analysis of spending patterns. What categories do people spend the most on? Are there any seasonal trends?",
+      "enabled_tools": ["mongodb_list-databases", "mongodb_list-collections", "mongodb_collection-schema", "mongodb_find", "mongodb_aggregate", "mcp-code-executor_execute"],
+      "mcp_server_names": ["mongodb", "mcp-code-executor"],
+      "category": "database_analysis",
+      "base_claims": [
+        "The response queries the cloud database to find purchase/spending data",
+        "The response identifies top spending categories",
+        "The response discusses temporal patterns or trends in the data"
+      ],
+      "persona_claims": {
+        "exec": [
+          "Top spending categories are presented as a ranked list or table",
+          "The response is under 200 words",
+          "Seasonal trends are summarized in one or two sentences",
+          "Actionable insights or recommendations are provided"
+        ],
+        "ds": [
+          "The MongoDB queries or aggregation pipelines used are shown",
+          "Statistical summaries include specific numbers (totals, averages, percentages)",
+          "The response discusses how seasonal trends were identified (methodology)",
+          "Data limitations or sample size considerations are mentioned",
+          "Results are in table format with clear column headers"
+        ],
+        "junior": [
+          "The response explains how to connect to and query a cloud database",
+          "Each step of the analysis is explained before showing results",
+          "Terms like 'aggregation', 'seasonal trend', 'spending category' are clarified",
+          "The response includes interpretation of what the numbers mean"
+        ],
+        "journalist": [
+          "The analysis is framed around a central finding or surprise",
+          "Specific examples of interesting purchases or patterns are highlighted",
+          "The response discusses what these spending patterns reveal about consumer behavior",
+          "Findings are presented in a narrative arc (setup, discovery, implication)"
+        ]
+      }
+    },
+    {
+      "id": "personal_005",
+      "prompt": "Investigate the area around the Eiffel Tower in Paris. I want to understand the neighborhood: what's the walkability like, what points of interest are nearby, and how well-connected is it by public transportation?",
+      "enabled_tools": ["osm-mcp-server_geocode", "osm-mcp-server_analyze_neighborhood", "osm-mcp-server_find_nearby_places", "osm-mcp-server_get_route_details", "wikipedia_get_page_summary", "ddg-search_search"],
+      "mcp_server_names": ["osm-mcp-server", "wikipedia", "ddg-search"],
+      "category": "geography",
+      "base_claims": [
+        "The response includes information about the Eiffel Tower's location",
+        "The response discusses walkability or transportation in the area",
+        "The response mentions specific nearby points of interest"
+      ],
+      "persona_claims": {
+        "exec": [
+          "Key scores (walkability, transit) are presented upfront as numbers",
+          "Nearby POIs are listed in a compact table or bullet list",
+          "The response is under 200 words",
+          "A clear verdict on the area's accessibility is given"
+        ],
+        "ds": [
+          "Specific walkability and transit scores/metrics are provided",
+          "The methodology for neighborhood analysis is mentioned",
+          "Distances to key POIs are given in meters or kilometers",
+          "Data is presented in structured format (tables with distance, type, name)"
+        ],
+        "junior": [
+          "The response explains what walkability and transit scores mean",
+          "The neighborhood is described in a way that helps visualize the area",
+          "The response explains how the analysis tools work",
+          "Points of interest are described with context (what they are, why they matter)"
+        ],
+        "journalist": [
+          "The response paints a vivid picture of the neighborhood experience",
+          "Historical or cultural context about the area is woven in",
+          "The narrative helps the reader imagine visiting the area",
+          "Specific interesting or surprising nearby places are highlighted as stories"
+        ]
+      }
+    },
+    {
+      "id": "personal_006",
+      "prompt": "Look at my local movie data and tell me about the films in the collection. What genres are represented, which films stand out, and what can you tell me about the overall quality and variety?",
+      "enabled_tools": ["filesystem_read_file", "filesystem_list_directory", "mcp-code-executor_execute", "cli-mcp-server_run_command"],
+      "mcp_server_names": ["filesystem", "mcp-code-executor", "cli-mcp-server"],
+      "category": "data_analysis",
+      "base_claims": [
+        "The response references movie data from local files",
+        "The response discusses genres represented in the collection",
+        "The response identifies notable or standout films"
+      ],
+      "persona_claims": {
+        "exec": [
+          "Genre distribution is shown as a ranked list or table",
+          "Top films are highlighted with a clear 'best of' selection",
+          "The response is under 150 words of prose",
+          "A one-sentence overall assessment of the collection is provided"
+        ],
+        "ds": [
+          "Quantitative genre breakdown is provided (counts, percentages)",
+          "The response includes statistical measures of quality (mean/median ratings, distributions)",
+          "The code or method used to analyze the data is shown",
+          "The response discusses potential biases in the collection"
+        ],
+        "junior": [
+          "The response explains how the movie data is structured before analyzing it",
+          "Genre categories are explained with examples",
+          "The analysis walks through each finding step by step",
+          "The response explains what 'standout' means and how films were selected"
+        ],
+        "journalist": [
+          "The response opens with the most interesting finding about the collection",
+          "Specific films are discussed as mini-stories or highlights",
+          "The narrative connects the collection to broader cultural trends",
+          "The writing is engaging and avoids dry statistical language"
+        ]
+      }
+    },
+    {
+      "id": "personal_007",
+      "prompt": "I have a knowledge graph with information about people I know. Can you explore it and tell me about the connections between people, their professions, and any interesting relationships you find?",
+      "enabled_tools": ["memory_read_graph", "memory_search_nodes", "memory_open_nodes", "ddg-search_search", "wikipedia_get_page_summary"],
+      "mcp_server_names": ["memory", "ddg-search", "wikipedia"],
+      "category": "knowledge_graph",
+      "base_claims": [
+        "The response reads from the knowledge graph",
+        "The response identifies people and their professions",
+        "The response describes connections or relationships between people"
+      ],
+      "persona_claims": {
+        "exec": [
+          "Key people and their roles are listed in a compact table",
+          "The most important connections are highlighted in 2-3 bullet points",
+          "The response is under 150 words",
+          "No technical details about graph structure are included"
+        ],
+        "ds": [
+          "The graph structure is described (number of nodes, edges, types)",
+          "The response shows how the graph was queried",
+          "Relationships are presented in a structured format",
+          "The response distinguishes between direct and inferred connections"
+        ],
+        "junior": [
+          "The response explains what a knowledge graph is before exploring it",
+          "Each person's profile is introduced with context",
+          "The response explains how connections between people were discovered",
+          "The narrative walks through the exploration process step by step"
+        ],
+        "journalist": [
+          "The response frames the network as a social story",
+          "Interesting or unexpected connections are highlighted as discoveries",
+          "People are described with vivid details, not just job titles",
+          "The narrative has a sense of investigation and discovery"
+        ]
+      }
+    },
+    {
+      "id": "personal_008",
+      "prompt": "Search for recent research papers about protein folding prediction on arxiv. Summarize the current state of the field, key methods, and notable recent advances.",
+      "enabled_tools": ["arxiv_search_papers", "arxiv_get_paper_details", "ddg-search_search", "wikipedia_get_page_summary"],
+      "mcp_server_names": ["arxiv", "ddg-search", "wikipedia"],
+      "category": "research",
+      "base_claims": [
+        "The response searches arxiv for protein folding papers",
+        "The response mentions at least one specific paper or method",
+        "The response provides an overview of the current state of the field"
+      ],
+      "persona_claims": {
+        "exec": [
+          "The field overview fits in 3-5 bullet points",
+          "Key advances are listed with their practical implications",
+          "The response is under 200 words",
+          "Technical jargon is minimized"
+        ],
+        "ds": [
+          "Specific paper titles, authors, and arxiv IDs are cited",
+          "Methods are described with technical detail (architectures, training approaches)",
+          "The response compares methods on reported metrics or benchmarks",
+          "Limitations of current approaches are discussed"
+        ],
+        "junior": [
+          "The response explains what protein folding is and why it matters",
+          "Key methods are explained in accessible language",
+          "The historical progression (how the field evolved) is outlined",
+          "Technical terms are defined when first introduced"
+        ],
+        "journalist": [
+          "The response opens with a hook about why protein folding matters for human health",
+          "Scientific advances are framed as breakthroughs with real-world impact",
+          "Key researchers or labs are mentioned as characters in the story",
+          "The narrative connects to broader themes (AI in science, drug discovery)"
+        ]
+      }
+    },
+    {
+      "id": "personal_009",
+      "prompt": "I have a sports dataset on my computer. Analyze the athlete performance data and tell me about the top performers, score distributions, and any interesting patterns you can find.",
+      "enabled_tools": ["filesystem_read_file", "filesystem_list_directory", "mcp-code-executor_execute", "cli-mcp-server_run_command"],
+      "mcp_server_names": ["filesystem", "mcp-code-executor", "cli-mcp-server"],
+      "category": "data_analysis",
+      "base_claims": [
+        "The response locates and reads a sports dataset from local files",
+        "The response identifies top-performing athletes",
+        "The response discusses score distributions or patterns"
+      ],
+      "persona_claims": {
+        "exec": [
+          "Top performers are listed in a ranked table",
+          "Key stats are presented as 2-3 headline numbers",
+          "The response is under 150 words of prose",
+          "A clear 'so what' takeaway is provided"
+        ],
+        "ds": [
+          "Descriptive statistics are provided (mean, median, std dev, min, max)",
+          "The code used for analysis is shown",
+          "Score distribution characteristics are discussed (skewness, outliers)",
+          "The response includes a methodological note on how 'top performers' were defined"
+        ],
+        "junior": [
+          "The response explains the dataset structure before analyzing it",
+          "Statistical terms (mean, distribution, outlier) are explained",
+          "The analysis proceeds step by step with explanations at each stage",
+          "The response connects numbers to real-world meaning"
+        ],
+        "journalist": [
+          "The response leads with the most surprising or compelling finding",
+          "Individual athletes are highlighted with mini-profiles",
+          "The narrative uses sports metaphors and engaging language",
+          "Patterns are framed as stories (underdog, dominant force, emerging talent)"
+        ]
+      }
+    },
+    {
+      "id": "personal_010",
+      "prompt": "I'm exploring paintings in the European art collection at the Met Museum. Help me understand the collection: what periods and styles are represented, which artists appear most frequently, and what are some must-see pieces?",
+      "enabled_tools": ["met-museum_search-museum-objects", "met-museum_get-museum-object", "wikipedia_get_page_summary", "wikipedia_search_wikipedia", "ddg-search_search"],
+      "mcp_server_names": ["met-museum", "wikipedia", "ddg-search"],
+      "category": "research",
+      "base_claims": [
+        "The response searches the Met Museum's European paintings collection",
+        "The response discusses art periods or styles represented",
+        "The response recommends specific pieces to see"
+      ],
+      "persona_claims": {
+        "exec": [
+          "Must-see pieces are listed as a top-5 with one-line descriptions",
+          "Periods/styles are summarized in a compact table or list",
+          "The response is under 200 words",
+          "No detailed art history analysis is included"
+        ],
+        "ds": [
+          "Quantitative breakdown of the collection is provided (counts by period, artist, style)",
+          "The search methodology is described",
+          "Recommendations are based on stated criteria (historical importance, rarity, etc.)",
+          "Specific object numbers or catalog references are included"
+        ],
+        "junior": [
+          "Art periods (Renaissance, Baroque, Impressionism) are briefly explained",
+          "The response helps the reader understand how the collection is organized",
+          "Recommended pieces include context about why they are significant",
+          "The narrative guides the reader as if walking through the museum"
+        ],
+        "journalist": [
+          "The response opens with a striking detail about the collection or a specific painting",
+          "Must-see pieces are described with vivid visual language",
+          "The artists behind the paintings are introduced as characters",
+          "The narrative connects the art to the human stories behind it"
+        ]
+      }
+    },
+    {
+      "id": "personal_011",
+      "prompt": "Check the weather conditions and analyze the neighborhood around Bellevue Hospital in New York City. What's the area like for visitors and patients? Include walkability, nearby amenities, and current conditions.",
+      "enabled_tools": ["osm-mcp-server_geocode", "osm-mcp-server_analyze_neighborhood", "osm-mcp-server_find_nearby_places", "weather_get-forecast", "wikipedia_get_page_summary"],
+      "mcp_server_names": ["osm-mcp-server", "weather", "wikipedia"],
+      "category": "geography",
+      "base_claims": [
+        "The response locates Bellevue Hospital in NYC",
+        "The response includes neighborhood analysis (walkability or nearby places)",
+        "The response includes weather or current conditions information"
+      ],
+      "persona_claims": {
+        "exec": [
+          "Key metrics (walkability score, weather summary) are presented upfront",
+          "Nearby amenities are in a compact list",
+          "The response is under 200 words",
+          "A clear verdict on the area's visitor-friendliness is given"
+        ],
+        "ds": [
+          "Specific numeric scores and distances are provided",
+          "Weather data includes specific temperatures, conditions, and forecasts",
+          "Nearby places are listed with distances in a structured table",
+          "The methodology for neighborhood analysis is noted"
+        ],
+        "junior": [
+          "The response provides background on Bellevue Hospital",
+          "Walkability and transit concepts are explained",
+          "The response walks through the analysis process",
+          "Weather information is interpreted (what it means for visitors)"
+        ],
+        "journalist": [
+          "The response paints a picture of arriving at Bellevue as a visitor",
+          "Historical context about the hospital is woven into the neighborhood description",
+          "The narrative focuses on the human experience of the area",
+          "Weather conditions are described atmospherically, not just as numbers"
+        ]
+      }
+    },
+    {
+      "id": "personal_012",
+      "prompt": "Look through the books available in the Open Library about ancient Rome. Find interesting titles and tell me what the collection reveals about how we study Roman history today.",
+      "enabled_tools": ["open-library_search_books", "open-library_get_book_by_isbn", "open-library_get_author", "ddg-search_search", "wikipedia_get_page_summary"],
+      "mcp_server_names": ["open-library", "ddg-search", "wikipedia"],
+      "category": "research",
+      "base_claims": [
+        "The response searches Open Library for books about ancient Rome",
+        "The response identifies specific book titles",
+        "The response discusses themes or approaches to studying Roman history"
+      ],
+      "persona_claims": {
+        "exec": [
+          "Top recommended books are in a numbered list with one-line descriptions",
+          "Major themes are summarized in 2-3 bullet points",
+          "The response is under 200 words",
+          "Recommendations are prioritized by relevance or importance"
+        ],
+        "ds": [
+          "Books are categorized by sub-topic or methodology",
+          "Publication dates and author credentials are included",
+          "The search strategy is described (what queries were used)",
+          "The response notes gaps or biases in the available collection"
+        ],
+        "junior": [
+          "The response provides brief context about why ancient Rome is studied",
+          "Each recommended book includes an explanation of who it's for and what they'll learn",
+          "Historical periods mentioned in book titles are briefly explained",
+          "The response suggests a reading order or starting point for beginners"
+        ],
+        "journalist": [
+          "The response opens with a compelling question about Roman history",
+          "Books are presented as windows into specific stories or mysteries",
+          "The narrative connects ancient Rome to modern parallels",
+          "Authors are introduced as storytellers or detectives of the past"
+        ]
+      }
+    }
+  ]
+}
