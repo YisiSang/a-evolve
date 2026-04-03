@@ -93,9 +93,13 @@ class PersonalizedMcpBenchmark(McpAtlasBenchmark):
             f"EVALUATOR CONTEXT:\n"
             f"You are evaluating this response from the perspective of a "
             f"'{self.persona.name}' user ({self.persona.role}). "
-            f"This user {self.persona.description}\n"
-            f"Their preferences: verbosity={self.persona.verbosity}, "
-            f"format={self.persona.format}, depth={self.persona.depth}.\n"
+            f"{self.persona.description}\n"
+            f"User profile: expertise={self.persona.expertise}, "
+            f"scope={self.persona.scope}, task_stage={self.persona.task_stage}, "
+            f"register={self.persona.register}. "
+            f"Output preferences: verbosity={self.persona.verbosity}, "
+            f"format={self.persona.format}, "
+            f"reasoning_display={self.persona.reasoning_display}.\n"
             f"Evaluate whether the claim is met given these expectations.\n\n"
         )
         base_prompt = super()._get_evaluation_prompt(claim, response)
